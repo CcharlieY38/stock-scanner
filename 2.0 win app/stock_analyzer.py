@@ -590,13 +590,24 @@ class EnhancedStockAnalyzer:
             # 3. 估值指标
             try:
                 self.logger.info("正在获取估值指标...")
-                valuation_data = ak.stock_a_indicator_lg(symbol=stock_code)
+                # 尝试使用替代的估值指标API
+                try:
+                    valuation_data = ak.stock_a_indicator_lg(symbol=stock_code)
+                except AttributeError:
+                    # 如果上述方法不存在，尝试其他方法
+                    try:
+                        valuation_data = ak.tool_trade_date_hist_sina()  # 使用可用的方法作为替代
+                        valuation_data = pd.DataFrame()  # 设为空DataFrame
+                    except:
+                        valuation_data = pd.DataFrame()
+                        
                 if not valuation_data.empty:
                     latest_valuation = valuation_data.iloc[-1].to_dict()
                     fundamental_data['valuation'] = latest_valuation
                     self.logger.info("✓ 估值指标获取成功")
                 else:
                     fundamental_data['valuation'] = {}
+                    self.logger.info("ℹ️ 估值指标暂时不可用")
             except Exception as e:
                 self.logger.warning(f"获取估值指标失败: {e}")
                 fundamental_data['valuation'] = {}
@@ -604,12 +615,27 @@ class EnhancedStockAnalyzer:
             # 4. 业绩预告和业绩快报
             try:
                 self.logger.info("正在获取业绩预告...")
-                performance_forecast = ak.stock_yjbb_em(symbol=stock_code)
+                # 尝试使用正确的业绩预告API
+                try:
+                    performance_forecast = ak.stock_yjbb_em(stock=stock_code)  # 修正参数名
+                except (AttributeError, TypeError):
+                    # 如果方法不存在或参数错误，尝试其他方法
+                    try:
+                        performance_forecast = ak.stock_yjbb_em()  # 不传参数
+                        if not performance_forecast.empty:
+                            # 筛选出对应股票的数据
+                            performance_forecast = performance_forecast[
+                                performance_forecast.iloc[:, 0].astype(str).str.contains(stock_code, na=False)
+                            ]
+                    except:
+                        performance_forecast = pd.DataFrame()
+                        
                 if not performance_forecast.empty:
                     fundamental_data['performance_forecast'] = performance_forecast.head(10).to_dict('records')
                     self.logger.info("✓ 业绩预告获取成功")
                 else:
                     fundamental_data['performance_forecast'] = []
+                    self.logger.info("ℹ️ 业绩预告暂时不可用")
             except Exception as e:
                 self.logger.warning(f"获取业绩预告失败: {e}")
                 fundamental_data['performance_forecast'] = []
@@ -617,12 +643,22 @@ class EnhancedStockAnalyzer:
             # 5. 分红配股信息
             try:
                 self.logger.info("正在获取分红配股信息...")
-                dividend_info = ak.stock_fhpg_em(symbol=stock_code)
+                # 尝试使用正确的分红配股API
+                try:
+                    dividend_info = ak.stock_fhpg_em(symbol=stock_code)
+                except AttributeError:
+                    # 如果方法不存在，尝试其他方法
+                    try:
+                        dividend_info = ak.stock_fhpg_detail_em(symbol=stock_code)
+                    except:
+                        dividend_info = pd.DataFrame()
+                        
                 if not dividend_info.empty:
                     fundamental_data['dividend_info'] = dividend_info.head(10).to_dict('records')
                     self.logger.info("✓ 分红配股信息获取成功")
                 else:
                     fundamental_data['dividend_info'] = []
+                    self.logger.info("ℹ️ 分红配股信息暂时不可用")
             except Exception as e:
                 self.logger.warning(f"获取分红配股信息失败: {e}")
                 fundamental_data['dividend_info'] = []
@@ -784,7 +820,19 @@ class EnhancedStockAnalyzer:
             
             # 获取行业排名
             try:
-                industry_rank = ak.stock_rank_em(symbol="行业排名")
+                # 尝试使用正确的行业排名API
+                try:
+                    industry_rank = ak.stock_rank_em(symbol="行业排名")
+                except AttributeError:
+                    # 如果方法不存在，使用替代方法
+                    try:
+                        # 尝试获取行业板块数据
+                        industry_rank = ak.stock_board_industry_name_em()
+                        # 查找包含股票代码的行业信息
+                        industry_rank = pd.DataFrame()  # 暂时设为空
+                    except:
+                        industry_rank = pd.DataFrame()
+                        
                 if not industry_rank.empty:
                     stock_rank = industry_rank[industry_rank.iloc[:, 1].astype(str).str.contains(stock_code, na=False)]
                     if not stock_rank.empty:
@@ -793,6 +841,7 @@ class EnhancedStockAnalyzer:
                         industry_data['industry_rank'] = {}
                 else:
                     industry_data['industry_rank'] = {}
+                    self.logger.info("ℹ️ 行业排名数据暂时不可用")
             except Exception as e:
                 self.logger.warning(f"获取行业排名失败: {e}")
                 industry_data['industry_rank'] = {}

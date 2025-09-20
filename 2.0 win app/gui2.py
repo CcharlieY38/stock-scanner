@@ -119,14 +119,14 @@ class ModernButton(QPushButton):
                 }
                 QPushButton:disabled {
                     background: #cccccc;
-                    color: #666666;
+                    color: black;
                 }
             """)
         elif button_type == "secondary":
             self.setStyleSheet("""
                 QPushButton {
                     background-color: #f8f9fa;
-                    color: #495057;
+                    color: black;
                     border: 2px solid #e9ecef;
                     border-radius: 8px;
                     padding: 12px 24px;
@@ -136,13 +136,13 @@ class ModernButton(QPushButton):
                 QPushButton:hover {
                     background-color: #e9ecef;
                     border-color: #adb5bd;
-                    color: #212529;
+                    color: black;
                 }
                 QPushButton:pressed {
                     background-color: #dee2e6;
                 }
                 QPushButton:disabled {
-                    color: #6c757d;
+                    color: black;
                     border-color: #dee2e6;
                 }
             """)
@@ -219,7 +219,7 @@ class ModernProgressBar(QProgressBar):
                 background-color: #e9ecef;
                 height: 12px;
                 text-align: center;
-                color: #495057;
+                color: black;
                 font-weight: 600;
             }
             QProgressBar::chunk {
@@ -530,7 +530,7 @@ class DataQualityIndicator(QFrame):
         title_label = QLabel(title)
         title_label.setStyleSheet("""
             QLabel {
-                color: #6c757d;
+                color: black;
                 font-size: 10px;
                 background: transparent;
             }
@@ -828,7 +828,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         self.version_label = QLabel(f"基于{ANALYZER_CLASS.__name__}")
         self.version_label.setStyleSheet("""
             QLabel {
-                color: #6c757d;
+                color: black;
                 font-size: 12px;
                 background: transparent;
             }
@@ -869,6 +869,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
                 margin: 2px;
                 border-radius: 6px;
                 font-weight: 600;
+                color: black;
             }
             QTabBar::tab:selected {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -877,6 +878,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
             }
             QTabBar::tab:hover {
                 background: #e9ecef;
+                color: black;
             }
         """)
         
@@ -900,7 +902,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         log_label = QLabel('📋 分析日志')
         log_label.setStyleSheet("""
             QLabel {
-                color: #495057;
+                color: black;
                 font-size: 16px;
                 font-weight: bold;
                 background: transparent;
@@ -940,7 +942,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
             QGroupBox {
                 font-weight: bold;
                 font-size: 14px;
-                color: #495057;
+                color: black;
                 border: 2px solid #e9ecef;
                 border-radius: 8px;
                 margin-top: 12px;
@@ -971,7 +973,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         self.enable_streaming_cb.setStyleSheet("""
             QCheckBox {
                 font-size: 14px;
-                color: #495057;
+                color: black;
                 spacing: 8px;
             }
             QCheckBox::indicator {
@@ -1015,7 +1017,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
             QGroupBox {
                 font-weight: bold;
                 font-size: 14px;
-                color: #495057;
+                color: black;
                 border: 2px solid #e9ecef;
                 border-radius: 8px;
                 margin-top: 12px;
@@ -1051,7 +1053,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         self.current_stock_label = QLabel()
         self.current_stock_label.setStyleSheet("""
             QLabel {
-                color: #6c757d;
+                color: black;
                 font-size: 12px;
                 font-style: italic;
                 background: transparent;
@@ -1417,7 +1419,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         quality_label = QLabel('📊 数据质量指标')
         quality_label.setStyleSheet("""
             QLabel {
-                color: #495057;
+                color: black;
                 font-size: 14px;
                 font-weight: bold;
                 background: transparent;

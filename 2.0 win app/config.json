@@ -1,0 +1,82 @@
+{
+    "api_keys": {
+        "openai": "",
+        "anthropic": "",
+        "zhipu": "",
+        "notes": "请填入您的API密钥"
+    },
+    "ai": {
+        "model_preference": "openai",
+        "models": {
+            "openai": "gpt-4o-mini",
+            "anthropic": "claude-3-haiku-20240307",
+            "zhipu": "chatglm_turbo"
+        },
+        "max_tokens": 6000,
+        "temperature": 0.7,
+        "api_base_urls": {
+            "openai": "https://api.openai.com/v1",
+            "notes": "如使用中转API，修改上述URL"
+        }
+    },
+    "analysis_weights": {
+        "technical": 0.4,
+        "fundamental": 0.4,
+        "sentiment": 0.2,
+        "notes": "权重总和应为1.0"
+    },
+    "technical_thresholds": {
+        "rsi_overbought": 70.0,
+        "rsi_oversold": 30.0,
+        "rsi_neutral_low": 45.0,
+        "rsi_neutral_high": 65.0,
+        "bb_lower": 0.2,
+        "bb_upper": 0.8,
+        "volume_ratio_low": 0.6,
+        "volume_ratio_high": 1.5,
+        "volume_ratio_very_low": 0.7,
+        "volume_ratio_very_high": 2.0,
+        "atr_high_risk": 6.0,
+        "atr_low_vol": 2.0,
+        "confirm_days": 1,
+        "notes": "可调技术面阈值与确认天数"
+    },
+    "cache": {
+        "price_hours": 1,
+        "fundamental_hours": 6,
+        "news_hours": 2
+    },
+    "streaming": {
+        "enabled": true,
+        "show_thinking": true,
+        "delay": 0.1
+    },
+    "analysis_params": {
+        "max_news_count": 200,
+        "technical_period_days": 365,
+        "financial_indicators_count": 25
+    },
+    "logging": {
+        "level": "INFO",
+        "file": "stock_analyzer.log"
+    },
+    "data_sources": {
+        "akshare_token": "",
+        "backup_sources": [
+            "akshare"
+        ]
+    },
+    "ui": {
+        "theme": "default",
+        "language": "zh_CN",
+        "window_size": [
+            1200,
+            800
+        ]
+    },
+    "_metadata": {
+        "version": "3.0.0",
+        "created": "2025-09-20T14:52:19.010087",
+        "description": "增强版AI股票分析系统配置文件"
+    }
+}
