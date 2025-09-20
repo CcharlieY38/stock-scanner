@@ -1,6 +1,7 @@
 """
 增强版现代股票分析系统
 支持25项财务指标、详细新闻分析、技术分析、情绪分析和AI增强分析
+数据源：BaoStock + akshare（备用）
 """
 
 import os
@@ -14,6 +15,33 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import time
 import re
+
+# BaoStock数据接口
+import baostock as bs
+
+def check_market_status():
+    """检查A股市场开盘状态"""
+    now = datetime.now()
+    weekday = now.weekday()  # 0=周一, 6=周日
+    hour = now.hour
+    minute = now.minute
+    current_time = hour * 100 + minute  # 转换为HHMM格式便于比较
+    
+    # 检查是否为交易日（周一到周五）
+    if weekday >= 5:  # 周六周日
+        return False, "市场休市（周末）"
+    
+    # A股交易时间：
+    # 上午：9:30-11:30
+    # 下午：13:00-15:00
+    if (930 <= current_time <= 1130) or (1300 <= current_time <= 1500):
+        return True, "市场开盘中"
+    elif current_time < 930:
+        return False, "市场未开盘（早盘前）"
+    elif 1130 < current_time < 1300:
+        return False, "市场休市（午休）"
+    else:  # current_time > 1500
+        return False, "市场收盘"
 
 # 忽略警告
 warnings.filterwarnings('ignore')
@@ -35,6 +63,9 @@ class EnhancedStockAnalyzer:
         """初始化分析器"""
         self.logger = logging.getLogger(__name__)
         self.config_file = config_file
+        
+        # 初始化BaoStock连接
+        self._init_baostock()
         
         # 加载配置文件
         self.config = self._load_config()
@@ -253,6 +284,68 @@ class EnhancedStockAnalyzer:
         self.logger.info(f"📰 最大新闻数量: {self.analysis_params['max_news_count']}")
         self.logger.info("=" * 35)
 
+    def _init_baostock(self):
+        """初始化BaoStock连接"""
+        try:
+            # 登录BaoStock系统
+            lg = bs.login()
+            if lg.error_code != '0':
+                self.logger.error(f"BaoStock登录失败: {lg.error_msg}")
+                raise Exception(f"BaoStock登录失败: {lg.error_msg}")
+            else:
+                self.logger.info("✅ BaoStock连接成功")
+                self.baostock_connected = True
+        except Exception as e:
+            self.logger.warning(f"⚠️ BaoStock连接失败，将使用akshare作为备用: {e}")
+            self.baostock_connected = False
+
+    def _format_stock_code_for_baostock(self, stock_code):
+        """格式化股票代码为BaoStock格式"""
+        # BaoStock需要带交易所前缀的格式，如sh.600000, sz.000001
+        if stock_code.startswith(('60', '68', '90')):
+            return f"sh.{stock_code}"
+        elif stock_code.startswith(('00', '30', '20')):
+            return f"sz.{stock_code}"
+        else:
+            # 默认认为是深交所
+            return f"sz.{stock_code}"
+
+    def _query_baostock_data(self, query_func, *args, **kwargs):
+        """安全查询BaoStock数据的通用方法"""
+        try:
+            if not self.baostock_connected:
+                raise Exception("BaoStock未连接")
+            
+            result = query_func(*args, **kwargs)
+            if result.error_code != '0':
+                raise Exception(f"查询失败: {result.error_msg}")
+            
+            # 转换为DataFrame
+            data_list = []
+            while (result.error_code == '0') & result.next():
+                data_list.append(result.get_row_data())
+            
+            if not data_list:
+                return pd.DataFrame()
+            
+            # 使用result的字段名作为列名
+            columns = result.fields if hasattr(result, 'fields') else None
+            df = pd.DataFrame(data_list, columns=columns)
+            return df
+            
+        except Exception as e:
+            self.logger.warning(f"BaoStock查询失败: {e}")
+            return pd.DataFrame()
+
+    def __del__(self):
+        """析构函数，确保BaoStock连接被正确关闭"""
+        try:
+            if hasattr(self, 'baostock_connected') and self.baostock_connected:
+                bs.logout()
+                self.logger.info("BaoStock连接已关闭")
+        except:
+            pass
+
     # =============================
     # 通用辅助函数（不改外部接口）
     # =============================
@@ -377,20 +470,122 @@ class EnhancedStockAnalyzer:
         return float(np.tanh(score / max(1.0, hits)))
 
     def get_stock_data(self, stock_code, period='1y'):
-        """获取股票价格数据"""
+        """获取股票价格数据 - 优先使用BaoStock"""
         if stock_code in self.price_cache:
             cache_time, data = self.price_cache[stock_code]
             if datetime.now() - cache_time < self.cache_duration:
                 self.logger.info(f"使用缓存的价格数据: {stock_code}")
                 return data
 
+        # 首先尝试使用BaoStock
+        try:
+            if self.baostock_connected:
+                return self._get_stock_data_from_baostock(stock_code, period)
+        except Exception as e:
+            self.logger.warning(f"BaoStock获取数据失败，尝试使用akshare: {e}")
+
+        # 备用方案：使用akshare
+        try:
+            return self._get_stock_data_from_akshare(stock_code, period)
+        except Exception as e:
+            self.logger.error(f"所有数据源均失败: {e}")
+            raise ValueError(f"无法获取股票 {stock_code} 的数据")
+
+    def _get_stock_data_from_baostock(self, stock_code, period='1y'):
+        """使用BaoStock获取股票价格数据"""
+        try:
+            # 计算时间范围
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=self.analysis_params['technical_period_days'])).strftime('%Y-%m-%d')
+            
+            # 格式化股票代码
+            formatted_code = self._format_stock_code_for_baostock(stock_code)
+            
+            self.logger.info(f"正在从BaoStock获取 {stock_code} 的历史数据...")
+            
+            # 查询日线数据
+            rs = bs.query_history_k_data_plus(
+                formatted_code,
+                "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="3"  # 3表示后复权
+            )
+            
+            if rs.error_code != '0':
+                raise Exception(f"BaoStock查询失败: {rs.error_msg}")
+            
+            # 转换为DataFrame
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+            
+            if not data_list:
+                raise ValueError(f"BaoStock未返回数据")
+            
+            stock_data = pd.DataFrame(data_list, columns=rs.fields)
+            
+            # 数据预处理
+            stock_data = self._preprocess_baostock_data(stock_data, stock_code)
+            
+            # 缓存数据
+            self.price_cache[stock_code] = (datetime.now(), stock_data)
+            self.logger.info(f"✓ 成功从BaoStock获取 {stock_code} 的价格数据，共 {len(stock_data)} 条记录")
+            
+            return stock_data
+            
+        except Exception as e:
+            self.logger.error(f"BaoStock获取数据失败: {e}")
+            raise
+
+    def _preprocess_baostock_data(self, stock_data, stock_code):
+        """预处理BaoStock数据"""
+        try:
+            # 过滤掉交易状态为0的数据（停牌等）
+            stock_data = stock_data[stock_data['tradestatus'] == '1'].copy()
+            
+            # 转换数据类型
+            numeric_columns = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
+            for col in numeric_columns:
+                if col in stock_data.columns:
+                    stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce')
+            
+            # 转换日期格式
+            stock_data['date'] = pd.to_datetime(stock_data['date'])
+            stock_data = stock_data.sort_values('date').reset_index(drop=True)
+            
+            # 计算技术指标所需的额外字段
+            stock_data['volume_ratio'] = 1.0  # BaoStock暂时无法直接获取，设为默认值
+            stock_data['change_pct'] = stock_data['pctChg']  # 重命名以保持一致性
+            stock_data['change_amount'] = stock_data['close'] - stock_data['preclose']
+            stock_data['turnover'] = stock_data['amount']  # 成交额
+            stock_data['turnover_rate'] = stock_data['turn']  # 换手率
+            
+            # 计算振幅
+            stock_data['amplitude'] = ((stock_data['high'] - stock_data['low']) / stock_data['preclose'] * 100).round(2)
+            
+            # 数据验证
+            if len(stock_data) > 0:
+                latest_close = stock_data['close'].iloc[-1]
+                latest_open = stock_data['open'].iloc[-1]
+                self.logger.info(f"✓ 数据验证 - 最新收盘价: {latest_close}, 最新开盘价: {latest_open}")
+            
+            return stock_data
+            
+        except Exception as e:
+            self.logger.error(f"BaoStock数据预处理失败: {e}")
+            raise
+
+    def _get_stock_data_from_akshare(self, stock_code, period='1y'):
+        """使用akshare获取股票价格数据（备用方案）"""
         try:
             import akshare as ak
             
             end_date = datetime.now().strftime('%Y%m%d')
             start_date = (datetime.now() - timedelta(days=self.analysis_params['technical_period_days'])).strftime('%Y%m%d')
             
-            self.logger.info(f"正在获取 {stock_code} 的历史数据...")
+            self.logger.info(f"正在从akshare获取 {stock_code} 的历史数据...")
             
             stock_data = ak.stock_zh_a_hist(
                 symbol=stock_code,
@@ -401,32 +596,34 @@ class EnhancedStockAnalyzer:
             )
             
             if stock_data.empty:
-                raise ValueError(f"无法获取股票 {stock_code} 的数据")
+                raise ValueError(f"akshare未返回数据")
             
-            # 智能处理列名映射 - 修复版本
+            # 标准化akshare列名映射
             try:
-                actual_columns = len(stock_data.columns)
-                self.logger.info(f"获取到 {actual_columns} 列数据，列名: {list(stock_data.columns)}")
+                # akshare返回的列名通常是中文，需要映射为英文
+                column_mapping = {
+                    '日期': 'date',
+                    '股票代码': 'code',
+                    '开盘': 'open',
+                    '收盘': 'close', 
+                    '最高': 'high',
+                    '最低': 'low',
+                    '成交量': 'volume',
+                    '成交额': 'amount',
+                    '振幅': 'amplitude',
+                    '涨跌幅': 'change_pct',
+                    '涨跌额': 'change_amount',
+                    '换手率': 'turnover_rate'
+                }
                 
-                # 根据实际返回的列数进行映射
-                if actual_columns == 13:  # 包含code列的完整格式
-                    standard_columns = ['date', 'code', 'open', 'close', 'high', 'low', 'volume', 'turnover', 'amplitude', 'change_pct', 'change_amount', 'turnover_rate', 'extra']
-                elif actual_columns == 12:  # 包含code列
-                    standard_columns = ['date', 'code', 'open', 'close', 'high', 'low', 'volume', 'turnover', 'amplitude', 'change_pct', 'change_amount', 'turnover_rate']
-                elif actual_columns == 11:  # 不包含code列的标准格式
-                    standard_columns = ['date', 'open', 'close', 'high', 'low', 'volume', 'turnover', 'amplitude', 'change_pct', 'change_amount', 'turnover_rate']
-                elif actual_columns == 10:  # 简化格式
-                    standard_columns = ['date', 'open', 'close', 'high', 'low', 'volume', 'turnover', 'amplitude', 'change_pct', 'change_amount']
-                else:
-                    # 对于未知格式，尝试智能识别
-                    standard_columns = [f'col_{i}' for i in range(actual_columns)]
-                    self.logger.warning(f"未知的列数格式 ({actual_columns} 列)，使用通用列名")
-                
-                # 创建列名映射
-                column_mapping = dict(zip(stock_data.columns, standard_columns))
+                # 应用列名映射
                 stock_data = stock_data.rename(columns=column_mapping)
+                self.logger.info(f"akshare列名映射完成: {list(stock_data.columns)}")
                 
-                self.logger.info(f"列名映射完成: {column_mapping}")
+                # 成交量单位转换：akshare是手(需要×100转为股数)
+                if 'volume' in stock_data.columns:
+                    stock_data['volume'] = stock_data['volume'] * 100
+                    self.logger.info("akshare成交量单位已转换为股数")
                 
             except Exception as e:
                 self.logger.warning(f"列名标准化失败: {e}，保持原列名")
@@ -520,26 +717,157 @@ class EnhancedStockAnalyzer:
             return pd.DataFrame()
 
     def get_comprehensive_fundamental_data(self, stock_code):
-        """获取25项综合财务指标数据"""
+        """获取25项综合财务指标数据 - 优先使用BaoStock"""
         if stock_code in self.fundamental_cache:
             cache_time, data = self.fundamental_cache[stock_code]
             if datetime.now() - cache_time < self.fundamental_cache_duration:
                 self.logger.info(f"使用缓存的基本面数据: {stock_code}")
                 return data
         
+        # 首先尝试使用BaoStock获取部分数据
+        fundamental_data = {}
+        
+        # BaoStock主要用于获取基本面概览
+        if self.baostock_connected:
+            try:
+                fundamental_data.update(self._get_fundamental_data_from_baostock(stock_code))
+            except Exception as e:
+                self.logger.warning(f"BaoStock获取基本面数据失败: {e}")
+        
+        # 使用akshare补充详细的财务指标（BaoStock的财务数据相对有限）
+        try:
+            akshare_data = self._get_fundamental_data_from_akshare(stock_code)
+            # 合并数据，akshare的数据优先级更高（更详细）
+            for key, value in akshare_data.items():
+                if key not in fundamental_data or not fundamental_data[key]:
+                    fundamental_data[key] = value
+                elif isinstance(value, dict) and isinstance(fundamental_data.get(key), dict):
+                    fundamental_data[key].update(value)
+        except Exception as e:
+            self.logger.warning(f"akshare获取基本面数据失败: {e}")
+        
+        # 缓存数据
+        self.fundamental_cache[stock_code] = (datetime.now(), fundamental_data)
+        self.logger.info(f"✓ {stock_code} 综合基本面数据获取完成并已缓存")
+        
+        return fundamental_data
+
+    def _get_fundamental_data_from_baostock(self, stock_code):
+        """使用BaoStock获取基本面数据"""
+        try:
+            fundamental_data = {}
+            formatted_code = self._format_stock_code_for_baostock(stock_code)
+            
+            self.logger.info(f"正在从BaoStock获取 {stock_code} 的基本面数据...")
+            
+            # 1. 获取股票基本信息
+            try:
+                rs = bs.query_stock_basic(code=formatted_code)
+                if rs.error_code == '0':
+                    basic_data = []
+                    while (rs.error_code == '0') & rs.next():
+                        basic_data.append(rs.get_row_data())
+                    
+                    if basic_data:
+                        basic_df = pd.DataFrame(basic_data, columns=rs.fields)
+                        if not basic_df.empty:
+                            basic_info = basic_df.iloc[0].to_dict()
+                            fundamental_data['basic_info'] = basic_info
+                            self.logger.info("✓ BaoStock基本信息获取成功")
+            except Exception as e:
+                self.logger.warning(f"BaoStock获取基本信息失败: {e}")
+                fundamental_data['basic_info'] = {}
+            
+            # 2. 获取最新的季度财务数据
+            try:
+                # 获取最近的财务报告期
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+                
+                # 获取盈利能力指标
+                rs_profit = bs.query_profit_data(
+                    code=formatted_code,
+                    year=datetime.now().year,
+                    quarter=((datetime.now().month-1) // 3) + 1
+                )
+                
+                if rs_profit.error_code == '0':
+                    profit_data = []
+                    while (rs_profit.error_code == '0') & rs_profit.next():
+                        profit_data.append(rs_profit.get_row_data())
+                    
+                    if profit_data:
+                        profit_df = pd.DataFrame(profit_data, columns=rs_profit.fields)
+                        if not profit_df.empty:
+                            latest_profit = profit_df.iloc[-1].to_dict()
+                            fundamental_data['profit_data'] = latest_profit
+                            self.logger.info("✓ BaoStock盈利能力数据获取成功")
+                
+                # 获取成长能力指标
+                rs_growth = bs.query_growth_data(
+                    code=formatted_code,
+                    year=datetime.now().year,
+                    quarter=((datetime.now().month-1) // 3) + 1
+                )
+                
+                if rs_growth.error_code == '0':
+                    growth_data = []
+                    while (rs_growth.error_code == '0') & rs_growth.next():
+                        growth_data.append(rs_growth.get_row_data())
+                    
+                    if growth_data:
+                        growth_df = pd.DataFrame(growth_data, columns=rs_growth.fields)
+                        if not growth_df.empty:
+                            latest_growth = growth_df.iloc[-1].to_dict()
+                            fundamental_data['growth_data'] = latest_growth
+                            self.logger.info("✓ BaoStock成长能力数据获取成功")
+                
+                # 获取杜邦指标
+                rs_dupont = bs.query_dupont_data(
+                    code=formatted_code,
+                    year=datetime.now().year,
+                    quarter=((datetime.now().month-1) // 3) + 1
+                )
+                
+                if rs_dupont.error_code == '0':
+                    dupont_data = []
+                    while (rs_dupont.error_code == '0') & rs_dupont.next():
+                        dupont_data.append(rs_dupont.get_row_data())
+                    
+                    if dupont_data:
+                        dupont_df = pd.DataFrame(dupont_data, columns=rs_dupont.fields)
+                        if not dupont_df.empty:
+                            latest_dupont = dupont_df.iloc[-1].to_dict()
+                            fundamental_data['dupont_data'] = latest_dupont
+                            self.logger.info("✓ BaoStock杜邦指标获取成功")
+                            
+            except Exception as e:
+                self.logger.warning(f"BaoStock获取财务指标失败: {e}")
+            
+            return fundamental_data
+            
+        except Exception as e:
+            self.logger.error(f"BaoStock获取基本面数据失败: {e}")
+            return {}
+
+    def _get_fundamental_data_from_akshare(self, stock_code):
+        """使用akshare获取基本面数据（详细版）"""
         try:
             import akshare as ak
             
             fundamental_data = {}
-            self.logger.info(f"开始获取 {stock_code} 的25项综合财务指标...")
+            self.logger.info(f"开始从akshare获取 {stock_code} 的25项综合财务指标...")
             
             # 1. 基本信息
             try:
                 self.logger.info("正在获取股票基本信息...")
                 stock_info = ak.stock_individual_info_em(symbol=stock_code)
-                info_dict = dict(zip(stock_info['item'], stock_info['value']))
-                fundamental_data['basic_info'] = info_dict
-                self.logger.info("✓ 股票基本信息获取成功")
+                if stock_info is not None and not stock_info.empty:
+                    info_dict = dict(zip(stock_info['item'], stock_info['value']))
+                    fundamental_data['basic_info'] = info_dict
+                    self.logger.info("✓ 股票基本信息获取成功")
+                else:
+                    fundamental_data['basic_info'] = {}
             except Exception as e:
                 self.logger.warning(f"获取基本信息失败: {e}")
                 fundamental_data['basic_info'] = {}
@@ -553,27 +881,29 @@ class EnhancedStockAnalyzer:
                 try:
                     # 利润表数据
                     income_statement = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按报告期")
-                    if not income_statement.empty:
+                    if income_statement is not None and not income_statement.empty:
                         latest_income = income_statement.iloc[0].to_dict()
                         financial_indicators.update(latest_income)
                 except Exception as e:
                     self.logger.warning(f"获取利润表数据失败: {e}")
                 
-                # 获取财务分析指标
                 try:
+                    # 财务分析指标
                     balance_sheet = ak.stock_financial_analysis_indicator(symbol=stock_code)
-                    if not balance_sheet.empty:
+                    if balance_sheet is not None and not balance_sheet.empty:
                         latest_balance = balance_sheet.iloc[-1].to_dict()
                         financial_indicators.update(latest_balance)
                 except Exception as e:
                     self.logger.warning(f"获取财务分析指标失败: {e}")
                 
-                # 获取现金流量表
                 try:
+                    # 现金流量表 - 修复None检查
                     cash_flow = ak.stock_cash_flow_sheet_by_report_em(symbol=stock_code)
-                    if not cash_flow.empty:
+                    if cash_flow is not None and not cash_flow.empty:
                         latest_cash = cash_flow.iloc[-1].to_dict()
                         financial_indicators.update(latest_cash)
+                    else:
+                        self.logger.info("现金流量表数据为空")
                 except Exception as e:
                     self.logger.warning(f"获取现金流量表失败: {e}")
                 
@@ -581,13 +911,14 @@ class EnhancedStockAnalyzer:
                 core_indicators = self._calculate_core_financial_indicators(financial_indicators)
                 fundamental_data['financial_indicators'] = core_indicators
                 
+                self.logger.info(f"✓ 成功计算 {len(core_indicators)} 项有效财务指标")
                 self.logger.info(f"✓ 获取到 {len(core_indicators)} 项财务指标")
                 
             except Exception as e:
                 self.logger.warning(f"获取财务指标失败: {e}")
                 fundamental_data['financial_indicators'] = {}
             
-            # 3. 估值指标
+            # 3. 估值指标 - 使用更稳定的API
             try:
                 self.logger.info("正在获取估值指标...")
                 # 尝试使用替代的估值指标API
@@ -601,7 +932,7 @@ class EnhancedStockAnalyzer:
                     except:
                         valuation_data = pd.DataFrame()
                         
-                if not valuation_data.empty:
+                if valuation_data is not None and not valuation_data.empty:
                     latest_valuation = valuation_data.iloc[-1].to_dict()
                     fundamental_data['valuation'] = latest_valuation
                     self.logger.info("✓ 估值指标获取成功")
@@ -622,7 +953,7 @@ class EnhancedStockAnalyzer:
                     # 如果方法不存在或参数错误，尝试其他方法
                     try:
                         performance_forecast = ak.stock_yjbb_em()  # 不传参数
-                        if not performance_forecast.empty:
+                        if performance_forecast is not None and not performance_forecast.empty:
                             # 筛选出对应股票的数据
                             performance_forecast = performance_forecast[
                                 performance_forecast.iloc[:, 0].astype(str).str.contains(stock_code, na=False)
@@ -630,7 +961,7 @@ class EnhancedStockAnalyzer:
                     except:
                         performance_forecast = pd.DataFrame()
                         
-                if not performance_forecast.empty:
+                if performance_forecast is not None and not performance_forecast.empty:
                     fundamental_data['performance_forecast'] = performance_forecast.head(10).to_dict('records')
                     self.logger.info("✓ 业绩预告获取成功")
                 else:
@@ -653,7 +984,7 @@ class EnhancedStockAnalyzer:
                     except:
                         dividend_info = pd.DataFrame()
                         
-                if not dividend_info.empty:
+                if dividend_info is not None and not dividend_info.empty:
                     fundamental_data['dividend_info'] = dividend_info.head(10).to_dict('records')
                     self.logger.info("✓ 分红配股信息获取成功")
                 else:
@@ -663,50 +994,24 @@ class EnhancedStockAnalyzer:
                 self.logger.warning(f"获取分红配股信息失败: {e}")
                 fundamental_data['dividend_info'] = []
             
-            # 6. 行业分析
+            # 6. 行业分析数据
             try:
                 self.logger.info("正在获取行业分析数据...")
-                industry_analysis = self._get_industry_analysis(stock_code)
-                fundamental_data['industry_analysis'] = industry_analysis
+                industry_data = self._get_industry_analysis(stock_code)
+                fundamental_data['industry_analysis'] = industry_data
                 self.logger.info("✓ 行业分析数据获取成功")
             except Exception as e:
                 self.logger.warning(f"获取行业分析失败: {e}")
                 fundamental_data['industry_analysis'] = {}
             
-            # 7. 股东信息
-            try:
-                self.logger.info("正在获取股东信息...")
-                shareholder_info = ak.stock_zh_a_gdhs(symbol=stock_code)
-                if not shareholder_info.empty:
-                    fundamental_data['shareholders'] = shareholder_info.head(20).to_dict('records')
-                    self.logger.info("✓ 股东信息获取成功")
-                else:
-                    fundamental_data['shareholders'] = []
-            except Exception as e:
-                self.logger.warning(f"获取股东信息失败: {e}")
-                fundamental_data['shareholders'] = []
-            
-            # 8. 机构持股
-            try:
-                self.logger.info("正在获取机构持股信息...")
-                institutional_holdings = ak.stock_institutional_holding_detail(symbol=stock_code)
-                if not institutional_holdings.empty:
-                    fundamental_data['institutional_holdings'] = institutional_holdings.head(20).to_dict('records')
-                    self.logger.info("✓ 机构持股信息获取成功")
-                else:
-                    fundamental_data['institutional_holdings'] = []
-            except Exception as e:
-                self.logger.warning(f"获取机构持股失败: {e}")
-                fundamental_data['institutional_holdings'] = []
-            
-            # 缓存数据
-            self.fundamental_cache[stock_code] = (datetime.now(), fundamental_data)
-            self.logger.info(f"✓ {stock_code} 综合基本面数据获取完成并已缓存")
+            # 其他数据项初始化
+            fundamental_data.setdefault('shareholders', [])
+            fundamental_data.setdefault('institutional_holdings', [])
             
             return fundamental_data
             
         except Exception as e:
-            self.logger.error(f"获取综合基本面数据失败: {str(e)}")
+            self.logger.error(f"akshare获取综合基本面数据失败: {str(e)}")
             return {
                 'basic_info': {},
                 'financial_indicators': {},
@@ -1145,8 +1450,43 @@ class EnhancedStockAnalyzer:
     def calculate_technical_indicators(self, price_data):
         """计算技术指标（增强版）"""
         try:
-            if price_data.empty or 'close' not in price_data.columns:
+            # 数据质量预检查
+            if price_data.empty:
+                self.logger.warning("价格数据为空，返回默认技术分析")
                 return self._get_default_technical_analysis()
+            
+            if 'close' not in price_data.columns:
+                self.logger.warning("缺少收盘价列，返回默认技术分析")
+                return self._get_default_technical_analysis()
+            
+            # 检查数据长度
+            data_length = len(price_data)
+            if data_length < 5:
+                self.logger.warning(f"数据长度不足({data_length}行)，返回默认技术分析")
+                return self._get_default_technical_analysis()
+            
+            # 检查关键列的数据质量
+            required_columns = ['close']
+            optional_columns = ['high', 'low', 'volume', 'open']
+            
+            for col in required_columns:
+                if col in price_data.columns:
+                    null_count = price_data[col].isnull().sum()
+                    if null_count > 0:
+                        self.logger.warning(f"'{col}'列有{null_count}个空值")
+                    
+                    # 尝试转换为数值类型
+                    try:
+                        price_data[col] = pd.to_numeric(price_data[col], errors='coerce')
+                        invalid_count = price_data[col].isnull().sum()
+                        if invalid_count > data_length * 0.5:  # 超过50%的数据无效
+                            self.logger.error(f"'{col}'列数据质量极差，有效数据不足50%")
+                            return self._get_default_technical_analysis()
+                    except Exception as e:
+                        self.logger.error(f"无法转换'{col}'列为数值类型: {e}")
+                        return self._get_default_technical_analysis()
+            
+            self.logger.info(f"技术指标计算开始：数据行数{data_length}，列数{len(price_data.columns)}")
 
             technical_analysis = {}
 
@@ -1336,13 +1676,25 @@ class EnhancedStockAnalyzer:
 
     def _get_default_technical_analysis(self):
         """获取默认技术分析结果"""
-        return {
-            'ma_trend': '数据不足',
-            'rsi': 50.0,
-            'macd_signal': '数据不足',
-            'bb_position': 0.5,
-            'volume_status': '数据不足'
-        }
+        # 检查市场状态
+        market_open, market_status = check_market_status()
+        
+        if not market_open:
+            return {
+                'ma_trend': market_status,
+                'rsi': 50.0,
+                'macd_signal': market_status,
+                'bb_position': 0.5,
+                'volume_status': market_status
+            }
+        else:
+            return {
+                'ma_trend': '计算中...',
+                'rsi': 50.0,
+                'macd_signal': '计算中...',
+                'bb_position': 0.5,
+                'volume_status': '计算中...'
+            }
 
     def calculate_technical_score(self, technical_analysis, confirm_days: Optional[int] = None):
         """计算技术分析得分（增强版）"""

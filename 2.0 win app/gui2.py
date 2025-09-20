@@ -1168,10 +1168,10 @@ class ModernStockAnalyzerGUI(QMainWindow):
 ## 🔧 技术面分析
 | 指标 | 值 | 状态 | 说明 |
 |------|-----|------|------|
-| **均线趋势** | - | {report['technical_analysis']['ma_trend']} | 多头排列看涨，空头排列看跌 |
+| **均线趋势** | 多空状态 | {report['technical_analysis']['ma_trend']} | 多头排列看涨，空头排列看跌 |
 | **RSI指标** | {report['technical_analysis']['rsi']:.1f} | {'超买' if report['technical_analysis']['rsi'] > 70 else '超卖' if report['technical_analysis']['rsi'] < 30 else '正常'} | 30-70为正常区间 |
-| **MACD信号** | - | {report['technical_analysis']['macd_signal']} | 金叉看涨，死叉看跌 |
-| **成交量状态** | - | {report['technical_analysis']['volume_status']} | 放量配合价格变动更有效 |
+| **MACD信号** | 趋势信号 | {report['technical_analysis']['macd_signal']} | 金叉看涨，死叉看跌 |
+| **成交量状态** | 量能表现 | {report['technical_analysis']['volume_status']} | 放量配合价格变动更有效 |
 | **布林带位置** | {report['technical_analysis']['bb_position']:.2f} | {'上轨附近' if report['technical_analysis']['bb_position'] > 0.8 else '下轨附近' if report['technical_analysis']['bb_position'] < 0.2 else '中位运行'} | 上轨阻力，下轨支撑 |
 
 ## 💰 基本面分析
