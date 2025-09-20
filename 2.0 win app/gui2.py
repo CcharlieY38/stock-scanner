@@ -811,7 +811,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(24, 16, 24, 16)
         
-        title_label = QLabel('🚀 现代股票分析系统')
+        title_label = QLabel(' ')
         title_label.setStyleSheet("""
             QLabel {
                 color: #2c3e50;

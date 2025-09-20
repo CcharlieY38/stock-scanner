@@ -1,34 +1,67 @@
-# Flask Web框架
-Flask
-Flask-CORS
-Werkzeug
+# Flask Web框架# Flask Web框架
 
-# 数据处理
-pandas
-numpy
+FlaskFlask
 
-# 股票数据获取
-akshare
+Flask-CORSFlask-CORS
 
-# AI接口支持
-openai
-anthropic
-zhipuai
+WerkzeugWerkzeug
 
-# HTTP请求
-requests
-urllib3
 
-# 其他工具
-python-dateutil
-pytz
-Jinja2
-MarkupSafe
-itsdangerous
-click
 
-# 性能优化
-gunicorn
+# 数据处理# 数据处理
 
-# 开发和调试（可选）
-python-dotenv
+pandaspandas
+
+numpynumpy
+
+
+
+# 股票数据获取# 股票数据获取
+
+akshareakshare
+
+
+
+# AI接口支持# AI接口支持
+
+openaiopenai
+
+anthropicanthropic
+
+zhipuaizhipuai
+
+
+
+# HTTP请求# HTTP请求
+
+requestsrequests
+
+urllib3urllib3
+
+
+
+# 其他工具# 其他工具
+
+python-dateutilpython-dateutil
+
+pytzpytz
+
+Jinja2Jinja2
+
+MarkupSafeMarkupSafe
+
+itsdangerousitsdangerous
+
+clickclick
+
+
+
+# 性能优化# 性能优化
+
+gunicorngunicorn
+
+
+
+# 开发和调试（可选）# 开发和调试（可选）
+
+python-dotenvpython-dotenv

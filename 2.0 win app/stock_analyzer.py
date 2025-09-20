@@ -31,7 +31,7 @@ logging.basicConfig(
 class EnhancedStockAnalyzer:
     """增强版综合股票分析器"""
     
-    def __init__(self, config_file='config.json'):
+    def __init__(self, config_file='config.json', weights: Optional[Dict[str, float]] = None, thresholds: Optional[Dict[str, float]] = None):
         """初始化分析器"""
         self.logger = logging.getLogger(__name__)
         self.config_file = config_file
@@ -49,13 +49,40 @@ class EnhancedStockAnalyzer:
         self.fundamental_cache = {}
         self.news_cache = {}
         
-        # 分析权重配置
-        weights = self.config.get('analysis_weights', {})
-        self.analysis_weights = {
-            'technical': weights.get('technical', 0.4),
-            'fundamental': weights.get('fundamental', 0.4),
-            'sentiment': weights.get('sentiment', 0.2)
+        # 分析权重配置（允许通过构造函数覆盖）
+        cfg_weights = self.config.get('analysis_weights', {})
+        merged_weights = {
+            'technical': cfg_weights.get('technical', 0.4),
+            'fundamental': cfg_weights.get('fundamental', 0.4),
+            'sentiment': cfg_weights.get('sentiment', 0.2)
         }
+        if isinstance(weights, dict) and weights:
+            merged_weights.update({k: float(v) for k, v in weights.items() if k in merged_weights})
+        self.analysis_weights = merged_weights
+        # 兼容：同时提供 self.weights 引用，便于外部或后续逻辑统一读取
+        self.weights = merged_weights
+
+        # 技术阈值配置（允许通过构造函数覆盖）
+        default_thresholds = {
+            'rsi_overbought': 70.0,
+            'rsi_oversold': 30.0,
+            'rsi_neutral_low': 45.0,
+            'rsi_neutral_high': 65.0,
+            'bb_lower': 0.2,
+            'bb_upper': 0.8,
+            'volume_ratio_low': 0.6,
+            'volume_ratio_high': 1.5,
+            'volume_ratio_very_low': 0.7,
+            'volume_ratio_very_high': 2.0,
+            'atr_high_risk': 6.0,
+            'atr_low_vol': 2.0,
+            'confirm_days': 1
+        }
+        cfg_thresholds = self.config.get('technical_thresholds', {})
+        default_thresholds.update({k: cfg_thresholds.get(k, v) for k, v in default_thresholds.items()})
+        if isinstance(thresholds, dict) and thresholds:
+            default_thresholds.update({k: thresholds.get(k, v) for k, v in default_thresholds.items()})
+        self.thresholds = default_thresholds
         
         # 流式推理配置
         streaming = self.config.get('streaming', {})
@@ -147,6 +174,22 @@ class EnhancedStockAnalyzer:
                 "sentiment": 0.2,
                 "notes": "权重总和应为1.0"
             },
+            "technical_thresholds": {
+                "rsi_overbought": 70.0,
+                "rsi_oversold": 30.0,
+                "rsi_neutral_low": 45.0,
+                "rsi_neutral_high": 65.0,
+                "bb_lower": 0.2,
+                "bb_upper": 0.8,
+                "volume_ratio_low": 0.6,
+                "volume_ratio_high": 1.5,
+                "volume_ratio_very_low": 0.7,
+                "volume_ratio_very_high": 2.0,
+                "atr_high_risk": 6.0,
+                "atr_low_vol": 2.0,
+                "confirm_days": 1,
+                "notes": "可调技术面阈值与确认天数"
+            },
             "cache": {
                 "price_hours": 1,
                 "fundamental_hours": 6,
@@ -209,6 +252,129 @@ class EnhancedStockAnalyzer:
         self.logger.info(f"📊 财务指标数量: {self.analysis_params['financial_indicators_count']}")
         self.logger.info(f"📰 最大新闻数量: {self.analysis_params['max_news_count']}")
         self.logger.info("=" * 35)
+
+    # =============================
+    # 通用辅助函数（不改外部接口）
+    # =============================
+    def _winsorize(self, series: pd.Series, lower: float = 0.02, upper: float = 0.98) -> pd.Series:
+        """分位数缩尾，提升稳健性"""
+        try:
+            if series is None or len(series) == 0:
+                return series
+            low = series.quantile(lower)
+            up = series.quantile(upper)
+            return series.clip(lower=low, upper=up)
+        except Exception:
+            return series
+
+    def _safe_ratio(self, a: float, b: float, default: float = 0.0) -> float:
+        """安全除法"""
+        try:
+            a = float(a)
+            b = float(b)
+            if b == 0 or np.isnan(b):
+                return default
+            val = a / b
+            if not np.isfinite(val):
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _normalize01(self, val: float, vmin: float, vmax: float, clip: bool = True) -> float:
+        """将数值标准化到[0,1]"""
+        try:
+            if vmax == vmin:
+                return 0.5
+            x = (float(val) - vmin) / (vmax - vmin)
+            if clip:
+                x = max(0.0, min(1.0, x))
+            return x
+        except Exception:
+            return 0.5
+
+    def _time_decay_weights(self, dates: List, half_life_days: float = 30.0) -> List[float]:
+        """时间衰减权重，越新的新闻权重越高，返回和为1的权重列表"""
+        try:
+            now = datetime.now()
+            weights = []
+            for d in dates:
+                try:
+                    dt = pd.to_datetime(d, errors='coerce')
+                    if pd.isna(dt):
+                        w = 0.7  # 无法解析日期时给一个中等权重
+                    else:
+                        days = max(0.0, (now - dt).days)
+                        w = np.exp(-np.log(2) * days / max(1e-6, half_life_days))
+                except Exception:
+                    w = 0.7
+                weights.append(float(w))
+            s = sum(weights)
+            return [w / s if s > 0 else 0.0 for w in weights]
+        except Exception:
+            return [1.0 / max(1, len(dates))] * max(1, len(dates))
+
+    def _tokenize_cn(self, text: str) -> List[str]:
+        """中文优先的轻量分词，优先使用jieba，不可用时回退到简单拆分"""
+        try:
+            import jieba  # 可选依赖
+            tokens = [t.strip() for t in jieba.lcut(text) if t.strip()]
+            return tokens
+        except Exception:
+            # 退化：按中英文数字片段与标点分隔
+            if not isinstance(text, str):
+                return []
+            text = text.strip()
+            if not text:
+                return []
+            # 将英文小写化，保留中文
+            text = text.lower()
+            # 以非字母数字和非中文字符切分
+            parts = re.split(r"[^0-9a-zA-Z\u4e00-\u9fa5]+", text)
+            return [p for p in parts if p]
+
+    def _sentiment_from_tokens(self, tokens: List[str], positive_words: set, negative_words: set) -> float:
+        """基于否定词和程度副词的简易情绪打分，返回[-1,1]"""
+        if not tokens:
+            return 0.0
+
+        negations = {"不", "未", "无", "非", "否", "没", "沒有", "并非", "並非"}
+        degree_map = {
+            # 程度副词 放大因子
+            "极其": 2.0, "非常": 1.8, "特别": 1.6, "显著": 1.5, "明显": 1.4,
+            "较为": 1.2, "比较": 1.2, "一定": 1.1, "略": 0.9, "有点": 0.8
+        }
+
+        window = 3  # 近3词窗口内的否定和程度影响
+        score = 0.0
+        hits = 0
+
+        for i, tok in enumerate(tokens):
+            base = 0.0
+            if tok in positive_words:
+                base = 1.0
+            elif tok in negative_words:
+                base = -1.0
+            else:
+                continue
+
+            # 回看窗口
+            neg_flip = 1
+            degree = 1.0
+            for j in range(max(0, i - window), i):
+                t = tokens[j]
+                if t in negations:
+                    neg_flip *= -1
+                if t in degree_map:
+                    degree *= degree_map[t]
+
+            score += base * neg_flip * degree
+            hits += 1
+
+        if hits == 0:
+            return 0.0
+        # 归一化到[-1,1]，对极端程度做tanh收敛
+        return float(np.tanh(score / max(1.0, hits)))
 
     def get_stock_data(self, stock_code, period='1y'):
         """获取股票价格数据"""
@@ -793,31 +959,35 @@ class EnhancedStockAnalyzer:
             return []
 
     def calculate_advanced_sentiment_analysis(self, comprehensive_news_data):
-        """计算高级情绪分析"""
+        """计算高级情绪分析（强化版）"""
         self.logger.info("开始高级情绪分析...")
-        
+
         try:
-            # 准备所有新闻文本
-            all_texts = []
-            
-            # 收集所有新闻文本
-            for news in comprehensive_news_data.get('company_news', []):
-                text = f"{news.get('title', '')} {news.get('content', '')}"
-                all_texts.append({'text': text, 'type': 'company_news', 'weight': 1.0})
-            
-            for announcement in comprehensive_news_data.get('announcements', []):
-                text = f"{announcement.get('title', '')} {announcement.get('content', '')}"
-                all_texts.append({'text': text, 'type': 'announcement', 'weight': 1.2})  # 公告权重更高
-            
-            for report in comprehensive_news_data.get('research_reports', []):
-                text = f"{report.get('title', '')} {report.get('rating', '')}"
-                all_texts.append({'text': text, 'type': 'research_report', 'weight': 0.9})
-            
-            for news in comprehensive_news_data.get('industry_news', []):
-                text = f"{news.get('title', '')} {news.get('content', '')}"
-                all_texts.append({'text': text, 'type': 'industry_news', 'weight': 0.7})
-            
-            if not all_texts:
+            # 统一抽取文本与元数据
+            items = []
+            def add_item(text, kind, date=None, source_weight=1.0):
+                if not isinstance(text, str) or not text.strip():
+                    return
+                items.append({
+                    'text': text.strip(),
+                    'type': kind,
+                    'date': date,
+                    'source_weight': float(source_weight)
+                })
+
+            for x in comprehensive_news_data.get('company_news', []) or []:
+                add_item(f"{x.get('title','')} {x.get('content','')}", 'company_news', x.get('date'), 1.0)
+
+            for x in comprehensive_news_data.get('announcements', []) or []:
+                add_item(f"{x.get('title','')} {x.get('content','')}", 'announcement', x.get('date'), 1.3)
+
+            for x in comprehensive_news_data.get('research_reports', []) or []:
+                add_item(f"{x.get('title','')} {x.get('rating','')}", 'research_report', x.get('date'), 1.1)
+
+            for x in comprehensive_news_data.get('industry_news', []) or []:
+                add_item(f"{x.get('title','')} {x.get('content','')}", 'industry_news', x.get('date'), 0.8)
+
+            if not items:
                 return {
                     'overall_sentiment': 0.0,
                     'sentiment_by_type': {},
@@ -825,97 +995,94 @@ class EnhancedStockAnalyzer:
                     'confidence_score': 0.0,
                     'total_analyzed': 0
                 }
-            
-            # 扩展的情绪词典
+
+            # 情感词表（可扩展）
             positive_words = {
-                '上涨', '涨停', '利好', '突破', '增长', '盈利', '收益', '回升', '强势', '看好',
-                '买入', '推荐', '优秀', '领先', '创新', '发展', '机会', '潜力', '稳定', '改善',
-                '提升', '超预期', '积极', '乐观', '向好', '受益', '龙头', '热点', '爆发', '翻倍',
-                '业绩', '增收', '扩张', '合作', '签约', '中标', '获得', '成功', '完成', '达成'
+                '上涨','涨停','利好','突破','增长','盈利','收益','回升','强势','看好',
+                '买入','推荐','优秀','领先','创新','发展','机会','潜力','稳定','改善',
+                '提升','超预期','积极','乐观','向好','受益','龙头','热点','爆发','翻倍',
+                '业绩','增收','扩张','合作','签约','中标','获得','成功','完成','达成'
             }
-            
             negative_words = {
-                '下跌', '跌停', '利空', '破位', '下滑', '亏损', '风险', '回调', '弱势', '看空',
-                '卖出', '减持', '较差', '落后', '滞后', '困难', '危机', '担忧', '悲观', '恶化',
-                '下降', '低于预期', '消极', '压力', '套牢', '被套', '暴跌', '崩盘', '踩雷', '退市',
-                '违规', '处罚', '调查', '停牌', '亏损', '债务', '违约', '诉讼', '纠纷', '问题'
+                '下跌','跌停','利空','破位','下滑','亏损','风险','回调','弱势','看空',
+                '卖出','减持','较差','落后','滞后','困难','危机','担忧','悲观','恶化',
+                '下降','低于预期','消极','压力','套牢','被套','暴跌','崩盘','踩雷','退市',
+                '违规','处罚','调查','停牌','债务','违约','诉讼','纠纷','问题'
             }
-            
-            # 分析每类新闻的情绪
-            sentiment_by_type = {}
-            overall_scores = []
-            
-            for text_data in all_texts:
-                try:
-                    text = text_data['text']
-                    text_type = text_data['type']
-                    weight = text_data['weight']
-                    
-                    if not text.strip():
-                        continue
-                    
-                    # 简单分词（可以用jieba替换）
-                    words = list(text)  # 简化版分词
-                    
-                    positive_count = sum(1 for word in positive_words if word in text)
-                    negative_count = sum(1 for word in negative_words if word in text)
-                    
-                    # 计算情绪得分
-                    total_sentiment_words = positive_count + negative_count
-                    if total_sentiment_words > 0:
-                        sentiment_score = (positive_count - negative_count) / total_sentiment_words
-                    else:
-                        sentiment_score = 0.0
-                    
-                    # 应用权重
-                    weighted_score = sentiment_score * weight
-                    overall_scores.append(weighted_score)
-                    
-                    # 按类型统计
-                    if text_type not in sentiment_by_type:
-                        sentiment_by_type[text_type] = []
-                    sentiment_by_type[text_type].append(weighted_score)
-                    
-                except Exception as e:
+
+            # 去重：相同标题/文本的只取一次
+            seen = set()
+            dedup_items = []
+            for it in items:
+                key = (it['type'], it['text'])
+                if key in seen:
                     continue
-            
-            # 计算总体情绪
-            overall_sentiment = sum(overall_scores) / len(overall_scores) if overall_scores else 0.0
-            
-            # 计算各类型平均情绪
-            avg_sentiment_by_type = {}
-            for text_type, scores in sentiment_by_type.items():
-                avg_sentiment_by_type[text_type] = sum(scores) / len(scores) if scores else 0.0
-            
-            # 判断情绪趋势
-            if overall_sentiment > 0.3:
-                sentiment_trend = '非常积极'
-            elif overall_sentiment > 0.1:
-                sentiment_trend = '偏向积极'
-            elif overall_sentiment > -0.1:
-                sentiment_trend = '相对中性'
-            elif overall_sentiment > -0.3:
-                sentiment_trend = '偏向消极'
+                seen.add(key)
+                dedup_items.append(it)
+
+            # 计算时间衰减权重
+            dates = [it.get('date') for it in dedup_items]
+            tweights = self._time_decay_weights(dates, half_life_days=20.0)
+            for it, tw in zip(dedup_items, tweights):
+                it['time_weight'] = float(tw)
+
+            # 逐条计算情绪分
+            by_type_scores = {}
+            weighted_scores = []
+            for it in dedup_items:
+                tokens = self._tokenize_cn(it['text'])
+                raw = self._sentiment_from_tokens(tokens, positive_words, negative_words)  # [-1,1]
+                # 综合权重：来源权重 * 时间权重
+                w = float(it.get('source_weight', 1.0)) * float(it.get('time_weight', 1.0))
+                weighted = raw * w
+                weighted_scores.append(weighted)
+
+                typ = it['type']
+                by_type_scores.setdefault(typ, []).append(weighted)
+
+            # 鲁棒聚合：采用缩尾与均值
+            ws = pd.Series(weighted_scores, dtype=float)
+            ws = self._winsorize(ws, 0.05, 0.95)
+            overall = float(ws.mean()) if len(ws) else 0.0
+
+            # 类型均值
+            avg_by_type = {}
+            for typ, arr in by_type_scores.items():
+                s = pd.Series(arr, dtype=float)
+                s = self._winsorize(s, 0.05, 0.95)
+                avg_by_type[typ] = float(s.mean()) if len(s) else 0.0
+
+            # 情绪趋势
+            if overall > 0.35:
+                trend = '非常积极'
+            elif overall > 0.15:
+                trend = '偏向积极'
+            elif overall > -0.15:
+                trend = '相对中性'
+            elif overall > -0.35:
+                trend = '偏向消极'
             else:
-                sentiment_trend = '非常消极'
-            
-            # 计算置信度
-            confidence_score = min(len(all_texts) / 50, 1.0)  # 基于新闻数量的置信度
-            
+                trend = '非常消极'
+
+            # 置信度：数据量与时间新鲜度合成
+            n = len(dedup_items)
+            recency = float(np.mean([it.get('time_weight', 0.0) for it in dedup_items])) if n else 0.0
+            confidence = float(min(1.0, (n / 60.0) * 0.6 + recency * 0.4))
+
             result = {
-                'overall_sentiment': overall_sentiment,
-                'sentiment_by_type': avg_sentiment_by_type,
-                'sentiment_trend': sentiment_trend,
-                'confidence_score': confidence_score,
-                'total_analyzed': len(all_texts),
-                'type_distribution': {k: len(v) for k, v in sentiment_by_type.items()},
-                'positive_ratio': len([s for s in overall_scores if s > 0]) / len(overall_scores) if overall_scores else 0,
-                'negative_ratio': len([s for s in overall_scores if s < 0]) / len(overall_scores) if overall_scores else 0
+                'overall_sentiment': overall,
+                'sentiment_by_type': avg_by_type,
+                'sentiment_trend': trend,
+                'confidence_score': confidence,
+                'total_analyzed': n,
+                'type_distribution': {k: len(v) for k, v in by_type_scores.items()},
+                'positive_ratio': float((ws > 0).mean()) if len(ws) else 0.0,
+                'negative_ratio': float((ws < 0).mean()) if len(ws) else 0.0
             }
-            
-            self.logger.info(f"✓ 高级情绪分析完成: {sentiment_trend} (得分: {overall_sentiment:.3f})")
+
+            self.logger.info(f"✓ 高级情绪分析完成: {trend} (得分: {overall:.3f})")
             return result
-            
+
         except Exception as e:
             self.logger.error(f"高级情绪分析失败: {e}")
             return {
@@ -927,124 +1094,193 @@ class EnhancedStockAnalyzer:
             }
 
     def calculate_technical_indicators(self, price_data):
-        """计算技术指标"""
+        """计算技术指标（增强版）"""
         try:
-            if price_data.empty:
+            if price_data.empty or 'close' not in price_data.columns:
                 return self._get_default_technical_analysis()
-            
+
             technical_analysis = {}
-            
-            # 移动平均线
+
+            # 为确认机制预留序列
+            confirm_n = int(max(1, min(10, float(self.thresholds.get('confirm_days', 1) or 1))))
+            rsi_series = None
+            macd_hist_series = None
+            macd_line_series = None
+            signal_line_series = None
+            ma20_series = None
+            close_series = None
+
+            close = price_data['close'].astype(float)
+            high = price_data['high'].astype(float) if 'high' in price_data.columns else close
+            low = price_data['low'].astype(float) if 'low' in price_data.columns else close
+            volume = price_data['volume'].astype(float) if 'volume' in price_data.columns else pd.Series([np.nan]*len(price_data), index=price_data.index)
+
+            # 移动平均线（短中长期）
             try:
-                price_data['ma5'] = price_data['close'].rolling(window=5, min_periods=1).mean()
-                price_data['ma10'] = price_data['close'].rolling(window=10, min_periods=1).mean()
-                price_data['ma20'] = price_data['close'].rolling(window=20, min_periods=1).mean()
-                price_data['ma60'] = price_data['close'].rolling(window=60, min_periods=1).mean()
-                
-                latest_price = float(price_data['close'].iloc[-1])
-                ma5 = float(price_data['ma5'].iloc[-1]) if not pd.isna(price_data['ma5'].iloc[-1]) else latest_price
-                ma10 = float(price_data['ma10'].iloc[-1]) if not pd.isna(price_data['ma10'].iloc[-1]) else latest_price
-                ma20 = float(price_data['ma20'].iloc[-1]) if not pd.isna(price_data['ma20'].iloc[-1]) else latest_price
-                
-                if latest_price > ma5 > ma10 > ma20:
+                price_data['ma20'] = close.rolling(window=20, min_periods=1).mean()
+                price_data['ma50'] = close.rolling(window=50, min_periods=1).mean()
+                price_data['ma120'] = close.rolling(window=120, min_periods=1).mean()
+
+                latest = float(close.iloc[-1])
+                ma20 = float(price_data['ma20'].iloc[-1])
+                ma50 = float(price_data['ma50'].iloc[-1]) if len(price_data) >= 50 else ma20
+                ma120 = float(price_data['ma120'].iloc[-1]) if len(price_data) >= 120 else ma50
+
+                if latest > ma20 > ma50 > ma120:
                     technical_analysis['ma_trend'] = '多头排列'
-                elif latest_price < ma5 < ma10 < ma20:
+                elif latest < ma20 < ma50 < ma120:
                     technical_analysis['ma_trend'] = '空头排列'
                 else:
                     technical_analysis['ma_trend'] = '震荡整理'
-                
-            except Exception as e:
+
+                technical_analysis['price_above_ma20'] = latest / ma20 if ma20 else 1.0
+                technical_analysis['ma_slope20'] = float(price_data['ma20'].diff().iloc[-1]) if len(price_data) >= 2 else 0.0
+                ma20_series = price_data['ma20']
+                close_series = close
+            except Exception:
                 technical_analysis['ma_trend'] = '计算失败'
-            
-            # RSI指标
+
+            # RSI (Wilder) 14
             try:
-                def calculate_rsi(prices, window=14):
-                    delta = prices.diff()
-                    gain = (delta.where(delta > 0, 0)).rolling(window=window, min_periods=1).mean()
-                    loss = (-delta.where(delta < 0, 0)).rolling(window=window, min_periods=1).mean()
-                    rs = gain / loss
-                    rsi = 100 - (100 / (1 + rs))
-                    return rsi
-                
-                rsi_series = calculate_rsi(price_data['close'])
-                technical_analysis['rsi'] = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-                
-            except Exception as e:
+                delta = close.diff()
+                gain = delta.clip(lower=0)
+                loss = -delta.clip(upper=0)
+                window = 14
+                avg_gain = gain.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
+                avg_loss = loss.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
+                rs = avg_gain / avg_loss.replace(0, np.nan)
+                rsi = 100 - (100 / (1 + rs))
+                rsi_series = rsi
+                rsi_val = float(rsi.iloc[-1]) if np.isfinite(rsi.iloc[-1]) else 50.0
+                technical_analysis['rsi'] = rsi_val
+            except Exception:
                 technical_analysis['rsi'] = 50.0
-            
-            # MACD指标
+
+            # MACD with confirmation
             try:
-                ema12 = price_data['close'].ewm(span=12, min_periods=1).mean()
-                ema26 = price_data['close'].ewm(span=26, min_periods=1).mean()
+                ema12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+                ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
                 macd_line = ema12 - ema26
-                signal_line = macd_line.ewm(span=9, min_periods=1).mean()
-                histogram = macd_line - signal_line
-                
-                if len(histogram) >= 2:
-                    current_hist = float(histogram.iloc[-1])
-                    prev_hist = float(histogram.iloc[-2])
-                    
-                    if current_hist > prev_hist and current_hist > 0:
-                        technical_analysis['macd_signal'] = '金叉向上'
-                    elif current_hist < prev_hist and current_hist < 0:
-                        technical_analysis['macd_signal'] = '死叉向下'
+                signal_line = macd_line.ewm(span=9, adjust=False, min_periods=9).mean()
+                hist = macd_line - signal_line
+                macd_hist_series = hist
+                macd_line_series = macd_line
+                signal_line_series = signal_line
+
+                macd_signal = '数据不足'
+                if len(hist) >= 3:
+                    last = float(hist.iloc[-1])
+                    prev = float(hist.iloc[-2])
+                    prev2 = float(hist.iloc[-3])
+                    cross_up = (macd_line.iloc[-2] < signal_line.iloc[-2]) and (macd_line.iloc[-1] > signal_line.iloc[-1])
+                    cross_down = (macd_line.iloc[-2] > signal_line.iloc[-2]) and (macd_line.iloc[-1] < signal_line.iloc[-1])
+                    trend_up = last > prev > prev2
+                    trend_down = last < prev < prev2
+
+                    if (cross_up or trend_up) and last > 0:
+                        macd_signal = '金叉向上'
+                    elif (cross_down or trend_down) and last < 0:
+                        macd_signal = '死叉向下'
                     else:
-                        technical_analysis['macd_signal'] = '横盘整理'
-                else:
-                    technical_analysis['macd_signal'] = '数据不足'
-                
-            except Exception as e:
+                        macd_signal = '横盘整理'
+
+                technical_analysis['macd_signal'] = macd_signal
+            except Exception:
                 technical_analysis['macd_signal'] = '计算失败'
-            
-            # 布林带
+
+            # 布林带位置与带宽
             try:
-                bb_window = min(20, len(price_data))
-                bb_middle = price_data['close'].rolling(window=bb_window, min_periods=1).mean()
-                bb_std = price_data['close'].rolling(window=bb_window, min_periods=1).std()
-                bb_upper = bb_middle + 2 * bb_std
-                bb_lower = bb_middle - 2 * bb_std
-                
-                latest_close = float(price_data['close'].iloc[-1])
-                bb_upper_val = float(bb_upper.iloc[-1])
-                bb_lower_val = float(bb_lower.iloc[-1])
-                
-                if bb_upper_val != bb_lower_val:
-                    bb_position = (latest_close - bb_lower_val) / (bb_upper_val - bb_lower_val)
+                bb_window = min(20, len(close))
+                mid = close.rolling(bb_window, min_periods=1).mean()
+                std = close.rolling(bb_window, min_periods=1).std()
+                upper = mid + 2*std
+                lower = mid - 2*std
+                last_close = float(close.iloc[-1])
+                u = float(upper.iloc[-1])
+                l = float(lower.iloc[-1])
+                if u != l:
+                    pos = (last_close - l) / (u - l)
                 else:
-                    bb_position = 0.5
-                
-                technical_analysis['bb_position'] = bb_position
-                
-            except Exception as e:
+                    pos = 0.5
+                technical_analysis['bb_position'] = float(pos)
+                technical_analysis['bb_width'] = float(self._safe_ratio(u - l, mid.iloc[-1], default=0.0))
+            except Exception:
                 technical_analysis['bb_position'] = 0.5
-            
-            # 成交量分析
+                technical_analysis['bb_width'] = 0.0
+
+            # 成交量与量能确认
             try:
-                volume_window = min(20, len(price_data))
-                avg_volume = price_data['volume'].rolling(window=volume_window, min_periods=1).mean().iloc[-1]
-                recent_volume = float(price_data['volume'].iloc[-1])
-                
-                if 'change_pct' in price_data.columns:
+                vol_ma20 = volume.rolling(window=min(20, len(volume)), min_periods=1).mean()
+                vol_ratio = float(self._safe_ratio(volume.iloc[-1], vol_ma20.iloc[-1], default=1.0)) if len(volume) else 1.0
+                technical_analysis['volume_ratio'] = vol_ratio
+
+                # 价格变动百分比
+                if 'change_pct' in price_data.columns and not pd.isna(price_data['change_pct'].iloc[-1]):
                     price_change = float(price_data['change_pct'].iloc[-1])
-                elif len(price_data) >= 2:
-                    current_price = float(price_data['close'].iloc[-1])
-                    prev_price = float(price_data['close'].iloc[-2])
-                    price_change = ((current_price - prev_price) / prev_price) * 100
+                elif len(close) >= 2 and close.iloc[-2] > 0:
+                    price_change = float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100)
                 else:
-                    price_change = 0
-                
-                if recent_volume > avg_volume * 1.5:
+                    price_change = 0.0
+
+                if vol_ratio > 1.5:
                     technical_analysis['volume_status'] = '放量上涨' if price_change > 0 else '放量下跌'
-                elif recent_volume < avg_volume * 0.5:
+                elif vol_ratio < 0.6:
                     technical_analysis['volume_status'] = '缩量调整'
                 else:
                     technical_analysis['volume_status'] = '温和放量'
-                
-            except Exception as e:
+            except Exception:
                 technical_analysis['volume_status'] = '数据不足'
-            
+                technical_analysis['volume_ratio'] = 1.0
+
+            # 换手率（如有）
+            try:
+                if 'turnover_rate' in price_data.columns:
+                    tr_series = pd.to_numeric(price_data['turnover_rate'], errors='coerce')
+                    if len(tr_series.dropna()):
+                        technical_analysis['turnover_rate'] = float(tr_series.iloc[-1])
+                        tr_ma20 = tr_series.rolling(window=min(20, len(tr_series)), min_periods=1).mean().iloc[-1]
+                        technical_analysis['turnover_rate_ma20'] = float(tr_ma20)
+                        technical_analysis['turnover_rate_ratio'] = float(self._safe_ratio(tr_series.iloc[-1], tr_ma20, default=1.0))
+            except Exception:
+                pass
+
+            # ATR(14) 波动率
+            try:
+                prev_close = close.shift(1)
+                tr = pd.concat([
+                    (high - low).abs(),
+                    (high - prev_close).abs(),
+                    (low - prev_close).abs()
+                ], axis=1).max(axis=1)
+                atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+                atr_pct = float(self._safe_ratio(atr.iloc[-1], close.iloc[-1], default=0.0) * 100.0) if len(atr) else 0.0
+                technical_analysis['atr_pct'] = atr_pct
+            except Exception:
+                technical_analysis['atr_pct'] = 0.0
+
+            # 附加用于多日确认的序列尾部片段（最多10根K线）
+            try:
+                tail_len = 10
+                series_tail = {}
+                if rsi_series is not None and len(rsi_series.dropna()) >= 1:
+                    series_tail['rsi'] = [float(x) if np.isfinite(x) else 50.0 for x in rsi_series.tail(tail_len).tolist()]
+                if macd_hist_series is not None and len(macd_hist_series.dropna()) >= 1:
+                    series_tail['macd_hist'] = [float(x) if np.isfinite(x) else 0.0 for x in macd_hist_series.tail(tail_len).tolist()]
+                if macd_line_series is not None and len(macd_line_series.dropna()) >= 1:
+                    series_tail['macd_line'] = [float(x) if np.isfinite(x) else 0.0 for x in macd_line_series.tail(tail_len).tolist()]
+                if signal_line_series is not None and len(signal_line_series.dropna()) >= 1:
+                    series_tail['signal_line'] = [float(x) if np.isfinite(x) else 0.0 for x in signal_line_series.tail(tail_len).tolist()]
+                if ma20_series is not None and len(ma20_series.dropna()) >= 1:
+                    series_tail['ma20'] = [float(x) if np.isfinite(x) else 0.0 for x in ma20_series.tail(tail_len).tolist()]
+                if close_series is not None and len(close_series.dropna()) >= 1:
+                    series_tail['close'] = [float(x) if np.isfinite(x) else 0.0 for x in close_series.tail(tail_len).tolist()]
+                if series_tail:
+                    technical_analysis['series'] = series_tail
+            except Exception:
+                pass
+
             return technical_analysis
-            
+
         except Exception as e:
             self.logger.error(f"技术指标计算失败: {str(e)}")
             return self._get_default_technical_analysis()
@@ -1059,103 +1295,234 @@ class EnhancedStockAnalyzer:
             'volume_status': '数据不足'
         }
 
-    def calculate_technical_score(self, technical_analysis):
-        """计算技术分析得分"""
+    def calculate_technical_score(self, technical_analysis, confirm_days: Optional[int] = None):
+        """计算技术分析得分（增强版）"""
         try:
-            score = 50
-            
+            score = 50.0
+
+            # 读取阈值
+            rsi_ob = float(self.thresholds.get('rsi_overbought', 70.0))
+            rsi_os = float(self.thresholds.get('rsi_oversold', 30.0))
+            rsi_nl = float(self.thresholds.get('rsi_neutral_low', 45.0))
+            rsi_nh = float(self.thresholds.get('rsi_neutral_high', 65.0))
+            bb_lo = float(self.thresholds.get('bb_lower', 0.2))
+            bb_hi = float(self.thresholds.get('bb_upper', 0.8))
+            vr_low = float(self.thresholds.get('volume_ratio_low', 0.6))
+            vr_high = float(self.thresholds.get('volume_ratio_high', 1.5))
+            vr_vlow = float(self.thresholds.get('volume_ratio_very_low', 0.7))
+            vr_vhigh = float(self.thresholds.get('volume_ratio_very_high', 2.0))
+            atr_hi = float(self.thresholds.get('atr_high_risk', 6.0))
+            atr_low = float(self.thresholds.get('atr_low_vol', 2.0))
+
+            n_confirm = int(confirm_days if confirm_days is not None else self.thresholds.get('confirm_days', 1))
+            n_confirm = max(1, min(10, n_confirm))
+
+            series = technical_analysis.get('series', {}) or {}
+            rsi_series = series.get('rsi') or []
+            macd_hist = series.get('macd_hist') or []
+            macd_line = series.get('macd_line') or []
+            signal_line = series.get('signal_line') or []
+            ma20 = series.get('ma20') or []
+            close = series.get('close') or []
+
+            def last_n_all(pred_arr, predicate):
+                try:
+                    arr = list(pred_arr)[-n_confirm:]
+                    return len(arr) >= n_confirm and all(predicate(x) for x in arr)
+                except Exception:
+                    return False
+
+            # 均线趋势评分（含多日确认：收盘价连续高于MA20，并且MA20向上/向下）
             ma_trend = technical_analysis.get('ma_trend', '数据不足')
             if ma_trend == '多头排列':
-                score += 20
+                confirmed_ma = False
+                if n_confirm > 1 and close and ma20 and len(close) >= n_confirm and len(ma20) >= n_confirm:
+                    above = [c > m for c, m in zip(close[-n_confirm:], ma20[-n_confirm:])]
+                    slope_up = all((ma20[i] - ma20[i-1]) >= 0 for i in range(1, min(len(ma20), n_confirm)))
+                    confirmed_ma = all(above) and slope_up
+                score += 18 if (n_confirm == 1 or confirmed_ma) else 12
             elif ma_trend == '空头排列':
-                score -= 20
-            
-            rsi = technical_analysis.get('rsi', 50)
-            if 30 <= rsi <= 70:
-                score += 10
-            elif rsi < 30:
-                score += 5
-            elif rsi > 70:
-                score -= 5
-            
+                confirmed_ma = False
+                if n_confirm > 1 and close and ma20 and len(close) >= n_confirm and len(ma20) >= n_confirm:
+                    below = [c < m for c, m in zip(close[-n_confirm:], ma20[-n_confirm:])]
+                    slope_down = all((ma20[i] - ma20[i-1]) <= 0 for i in range(1, min(len(ma20), n_confirm)))
+                    confirmed_ma = all(below) and slope_down
+                score -= 18 if (n_confirm == 1 or confirmed_ma) else 12
+
+            # RSI评分（用阈值）
+            rsi_val = float(technical_analysis.get('rsi', 50))
+            if rsi_nl <= rsi_val <= rsi_nh:
+                if n_confirm > 1 and rsi_series:
+                    in_band = last_n_all(rsi_series, lambda v: rsi_nl <= float(v) <= rsi_nh)
+                    score += 8 if in_band else 4
+                else:
+                    score += 8
+            elif rsi_os <= rsi_val < rsi_nl:
+                score += 4
+            elif rsi_nh < rsi_val <= rsi_ob + 5:
+                score -= 3
+            elif rsi_val < rsi_os:
+                score += 6  # 超卖反弹潜力
+            elif rsi_val > rsi_ob + 5:
+                score -= 8  # 超买风险
+
+            # MACD评分（多日确认：直方图持续走高/走低，且当前在零轴之上/之下）
             macd_signal = technical_analysis.get('macd_signal', '横盘整理')
             if macd_signal == '金叉向上':
-                score += 15
+                if n_confirm > 1 and macd_hist and macd_line and signal_line:
+                    arr_h = macd_hist[-n_confirm:]
+                    arr_m = macd_line[-n_confirm:]
+                    arr_s = signal_line[-n_confirm:]
+                    inc = all(arr_h[i] >= arr_h[i-1] for i in range(1, len(arr_h)))
+                    above = (arr_m[-1] > arr_s[-1]) and (arr_h[-1] > 0)
+                    score += 14 if (inc and above) else 8
+                else:
+                    score += 14
             elif macd_signal == '死叉向下':
-                score -= 15
-            
-            bb_position = technical_analysis.get('bb_position', 0.5)
-            if 0.2 <= bb_position <= 0.8:
-                score += 5
-            elif bb_position < 0.2:
-                score += 10
-            elif bb_position > 0.8:
-                score -= 5
-            
+                if n_confirm > 1 and macd_hist and macd_line and signal_line:
+                    arr_h = macd_hist[-n_confirm:]
+                    arr_m = macd_line[-n_confirm:]
+                    arr_s = signal_line[-n_confirm:]
+                    dec = all(arr_h[i] <= arr_h[i-1] for i in range(1, len(arr_h)))
+                    below = (arr_m[-1] < arr_s[-1]) and (arr_h[-1] < 0)
+                    score -= 14 if (dec and below) else 8
+                else:
+                    score -= 14
+
+            # 布林带位置评分（用阈值）
+            bb_position = float(technical_analysis.get('bb_position', 0.5))
+            if (bb_lo + 0.05) <= bb_position <= (bb_hi - 0.05):
+                score += 4
+            elif bb_position < bb_lo:
+                score += 7  # 下轨附近，反弹潜力
+            elif bb_position > (bb_hi + 0.05):
+                score -= 6  # 上轨附近，回落风险
+
+            # 成交量状态与量能数值化
             volume_status = technical_analysis.get('volume_status', '数据不足')
             if '放量上涨' in volume_status:
                 score += 10
             elif '放量下跌' in volume_status:
                 score -= 10
-            
-            score = max(0, min(100, score))
+
+            vol_ratio = float(technical_analysis.get('volume_ratio', 1.0))
+            if vol_ratio > vr_vhigh:
+                score += 4
+            elif vol_ratio < vr_vlow:
+                score -= 3
+
+            # 波动率（ATR%）
+            atr_pct = float(technical_analysis.get('atr_pct', 0.0))
+            if atr_pct > atr_hi:
+                score -= 6  # 波动过大
+            elif atr_pct < atr_low and ma_trend == '多头排列':
+                score += 3  # 稳定上行
+
+            score = float(max(0.0, min(100.0, score)))
             return score
-            
+
         except Exception as e:
             self.logger.error(f"技术分析评分失败: {str(e)}")
-            return 50
+            return 50.0
 
     def calculate_fundamental_score(self, fundamental_data):
-        """计算基本面得分"""
+        """计算基本面得分（增强版）"""
         try:
-            score = 50
-            
-            # 财务指标评分
-            financial_indicators = fundamental_data.get('financial_indicators', {})
-            if len(financial_indicators) >= 15:  # 有足够的财务指标
-                score += 20
-                
-                # 盈利能力评分
-                roe = financial_indicators.get('净资产收益率', 0)
-                if roe > 15:
-                    score += 10
-                elif roe > 10:
-                    score += 5
-                elif roe < 5:
-                    score -= 5
-                
-                # 偿债能力评分
-                debt_ratio = financial_indicators.get('资产负债率', 50)
-                if debt_ratio < 30:
-                    score += 5
-                elif debt_ratio > 70:
-                    score -= 10
-                
-                # 成长性评分
-                revenue_growth = financial_indicators.get('营收同比增长率', 0)
-                if revenue_growth > 20:
-                    score += 10
-                elif revenue_growth > 10:
-                    score += 5
-                elif revenue_growth < -10:
-                    score -= 10
-            
-            # 估值评分
-            valuation = fundamental_data.get('valuation', {})
-            if valuation:
-                score += 10
-            
-            # 业绩预告评分
-            performance_forecast = fundamental_data.get('performance_forecast', [])
-            if performance_forecast:
-                score += 10
-            
-            score = max(0, min(100, score))
+            score = 50.0
+
+            fi = fundamental_data.get('financial_indicators', {}) or {}
+            count = len(fi)
+            if count >= 15:
+                score += 18
+            elif count >= 8:
+                score += 8
+
+            # 盈利能力：ROE
+            roe = float(fi.get('净资产收益率', 0) or 0)
+            if roe > 20:
+                score += 12
+            elif roe > 15:
+                score += 8
+            elif roe > 10:
+                score += 4
+            elif roe < 5:
+                score -= 4
+
+            # 偿债能力：资产负债率（越低越好）
+            debt_ratio = float(fi.get('资产负债率', 50) or 50)
+            if debt_ratio < 30:
+                score += 6
+            elif debt_ratio > 70:
+                score -= 8
+
+            # 成长性：营收/净利增速
+            rev_g = float(fi.get('营收同比增长率', 0) or 0)
+            np_g = float(fi.get('净利润同比增长率', 0) or 0)
+            if rev_g > 20:
+                score += 6
+            elif rev_g > 10:
+                score += 3
+            elif rev_g < -10:
+                score -= 6
+
+            if np_g > 25:
+                score += 6
+            elif np_g > 10:
+                score += 3
+            elif np_g < -10:
+                score -= 8
+
+            # 估值：PE、PB（越低越好，行业差异忽略，给区间分）
+            val = fundamental_data.get('valuation', {}) or {}
+            try:
+                pe = float(val.get('市盈率', 0) or 0)
+            except Exception:
+                pe = 0
+            try:
+                pb = float(val.get('市净率', 0) or 0)
+            except Exception:
+                pb = 0
+            try:
+                dy = float(val.get('股息收益率', 0) or 0)
+            except Exception:
+                dy = 0
+
+            if 0 < pe <= 15:
+                score += 6
+            elif 15 < pe <= 30:
+                score += 2
+            elif pe > 60:
+                score -= 8
+
+            if 0 < pb <= 2:
+                score += 4
+            elif pb > 5:
+                score -= 6
+
+            if dy >= 3:
+                score += 4
+
+            # 业绩预告：正向措辞加分
+            forecasts = fundamental_data.get('performance_forecast', []) or []
+            positive_kw = ['预增','上调','超预期','扭亏','增长','改善']
+            negative_kw = ['预减','下调','低于预期','亏损','恶化']
+            pos_hit = 0
+            neg_hit = 0
+            for f in forecasts[:10]:
+                text = ' '.join([str(v) for v in (f.values() if isinstance(f, dict) else [f])])
+                if any(k in text for k in positive_kw):
+                    pos_hit += 1
+                if any(k in text for k in negative_kw):
+                    neg_hit += 1
+            score += min(10, pos_hit * 2)
+            score -= min(10, neg_hit * 2)
+
+            score = float(max(0.0, min(100.0, score)))
             return score
-            
+
         except Exception as e:
             self.logger.error(f"基本面评分失败: {str(e)}")
-            return 50
+            return 50.0
 
     def calculate_sentiment_score(self, sentiment_analysis):
         """计算情绪分析得分"""
@@ -1183,24 +1550,41 @@ class EnhancedStockAnalyzer:
             return 50
 
     def calculate_comprehensive_score(self, scores):
-        """计算综合得分"""
+        """计算综合得分（动态权重）"""
         try:
-            technical_score = scores.get('technical', 50)
-            fundamental_score = scores.get('fundamental', 50)
-            sentiment_score = scores.get('sentiment', 50)
-            
-            comprehensive_score = (
-                technical_score * self.analysis_weights['technical'] +
-                fundamental_score * self.analysis_weights['fundamental'] +
-                sentiment_score * self.analysis_weights['sentiment']
-            )
-            
-            comprehensive_score = max(0, min(100, comprehensive_score))
-            return comprehensive_score
-            
+            t = float(scores.get('technical', 50.0))
+            f = float(scores.get('fundamental', 50.0))
+            s = float(scores.get('sentiment', 50.0))
+
+            # 统一使用 self.weights（构造器可覆盖），向后兼容 self.analysis_weights
+            base_w = (getattr(self, 'weights', None) or self.analysis_weights).copy()
+            # 动态缩放：依据最近一次数据质量
+            dq = getattr(self, '_last_data_quality', {}) or {}
+            fi_count = float(dq.get('financial_indicators_count', 0) or 0)
+            news_count = float(dq.get('total_news_count', dq.get('news_count', 0)) or 0)
+            s_conf = float(dq.get('sentiment_confidence', dq.get('confidence_score', 0.0)) or 0.0)
+
+            f_scale = 0.6 + min(1.0, fi_count / 15.0) * 0.6  # 0.6~1.2
+            s_scale = 0.6 + min(1.0, news_count / 60.0) * 0.3 + min(1.0, s_conf) * 0.3  # 0.6~1.2
+            t_scale = 1.0  # 技术面保持基准
+
+            w_t = base_w.get('technical', 0.4) * t_scale
+            w_f = base_w.get('fundamental', 0.4) * f_scale
+            w_s = base_w.get('sentiment', 0.2) * s_scale
+
+            w_sum = w_t + w_f + w_s
+            if w_sum <= 0:
+                w_t, w_f, w_s = 0.4, 0.4, 0.2
+                w_sum = 1.0
+
+            w_t, w_f, w_s = w_t / w_sum, w_f / w_sum, w_s / w_sum
+
+            composite = t * w_t + f * w_f + s * w_s
+            return float(max(0.0, min(100.0, composite)))
+
         except Exception as e:
             self.logger.error(f"计算综合得分失败: {e}")
-            return 50
+            return 50.0
 
     def get_stock_name(self, stock_code):
         """获取股票名称"""
@@ -1762,23 +2146,83 @@ class EnhancedStockAnalyzer:
 - 研究报告：{len(sentiment_analysis.get('research_reports', []))}条"""
             analysis_sections.append(sentiment_desc)
             
-            # 5. 投资建议
+            # 5. 投资建议 + 可执行操作计划
             recommendation = self.generate_recommendation(scores)
+
+            # 构造关键位与风控参数
+            bb_pos = float(technical_analysis.get('bb_position', 0.5) or 0.5)
+            ma_trend = technical_analysis.get('ma_trend', '未知')
+            rsi_val = float(technical_analysis.get('rsi', 50))
+            macd_sig = technical_analysis.get('macd_signal', '未知')
+            vol_ratio = float(technical_analysis.get('volume_ratio', 1.0))
+            atr_pct = float(technical_analysis.get('atr_pct', 0.0))
+            price = float(price_info.get('current_price', 0.0))
+            ma20 = float(technical_analysis.get('price_above_ma20', 1.0) * price) if price > 0 else None
+
+            # 止损/止盈的基础（根据波动率ATR设定）
+            sl_pct = 0.06 if atr_pct == 0 else min(0.06, max(0.03, atr_pct / 100 * 2.5))  # 约2.5倍ATR%
+            tp_pct = max(0.06, min(0.18, sl_pct * 2.0))
+
+            # 下一交易日操作建议
+            next_day_plan = []
+            if ma_trend == '多头排列' and macd_sig == '金叉向上' and rsi_val < 70 and bb_pos <= 0.8:
+                next_day_plan.append("若高开并放量(量比>1.5)，可考虑分批跟进；低开不破 MA20 可在回踩时加仓。")
+            elif ma_trend == '震荡整理' and 0.3 <= bb_pos <= 0.7:
+                next_day_plan.append("震荡区间内高抛低吸：接近下轨/MA20附近小仓试多，靠近上轨逐步减仓。")
+            elif ma_trend == '空头排列' or macd_sig == '死叉向下':
+                next_day_plan.append("反弹缩量时逢高减仓；仅在强势放量收复MA20/MA50时考虑试探性仓位。")
+            else:
+                next_day_plan.append("等待方向选择：观察是否放量突破 MA20/MA50 或 MACD 重新转强后再行动。")
+
+            # 换手率与量能提醒
+            tr = technical_analysis.get('turnover_rate')
+            tr_ma20 = technical_analysis.get('turnover_rate_ma20')
+            tr_ratio = technical_analysis.get('turnover_rate_ratio')
+            turnover_tips = []
+            if tr is not None and tr_ma20 is not None and tr_ratio is not None:
+                if tr_ratio >= 1.8:
+                    turnover_tips.append(f"上一交易日换手率 {tr:.2f}% 显著高于20日均值({tr_ma20:.2f}%)，关注资金博弈与主力异动。")
+                elif tr_ratio <= 0.6:
+                    turnover_tips.append(f"上一交易日换手率 {tr:.2f}% 远低于20日均值({tr_ma20:.2f}%)，短线参与度偏低，突破需等待放量确认。")
+                else:
+                    turnover_tips.append(f"上一交易日换手率 {tr:.2f}%，接近20日均值({tr_ma20:.2f}%)，量能中性。")
+            else:
+                turnover_tips.append("未获取到换手率数据，量能研判以成交量比对为准。")
+
+            # 风险提醒
+            risks = []
+            if atr_pct >= 6.0:
+                risks.append("短期波动率偏高，严格控制仓位与止损，避免追高。")
+            if rsi_val >= 75:
+                risks.append("RSI 超买区域，出现长上影/放量滞涨需及时止盈。")
+            if ma_trend == '空头排列':
+                risks.append("中期趋势偏弱，反抽未站稳 MA20/MA50 前不宜重仓。")
+            if vol_ratio > 2.0 and macd_sig != '金叉向上':
+                risks.append("放量但动能未同步转强，警惕冲高回落。")
+            if not risks:
+                risks.append("常规市场风险：宏观政策、行业监管、黑天鹅事件等，建议分散持仓并设置风控阈值。")
+
             strategy = f"""## 🎯 投资策略建议
 
 **投资建议：{recommendation}**
 
-根据综合分析，建议如下：
+根据综合分析，执行要点如下：
 
-{'**积极配置**：各项指标表现优异，可适当加大仓位。' if comprehensive_score >= 80 else 
- '**谨慎买入**：整体表现良好，但需要关注风险点。' if comprehensive_score >= 60 else
- '**观望为主**：当前风险收益比一般，建议等待更好时机。' if comprehensive_score >= 40 else
- '**规避风险**：多项指标显示风险较大，建议减仓或观望。'}
+### 📅 下一交易日操作
+- {next_day_plan[0]}
 
-操作建议：
-- 买入时机：技术面突破关键位置时
-- 止损位置：跌破重要技术支撑
-- 持有周期：中长期为主"""
+### 🛡️ 风控与仓位管理
+- 初始止损：{sl_pct*100:.1f}%（以入场价为基准），触发即退出，避免亏损扩大。
+- 分批止盈：第一目标 {tp_pct*100:.1f}%，第二目标 {(tp_pct*100*1.5):.1f}%；到价分批落袋。
+- 动态跟踪止损：若盈利超过第一目标，将止损上移至成本价上方 1%-2%。
+
+### 🔁 换手率与量能提醒
+- {turnover_tips[0]}
+- 关注量比与成交额变化，突破关键均线（如 MA20/MA50）时需放量配合方可确认有效性。
+
+### ⚠️ 风险提醒
+- {risks[0]}
+"""
             analysis_sections.append(strategy)
             
             return "\n\n".join(analysis_sections)
@@ -1872,9 +2316,20 @@ class EnhancedStockAnalyzer:
                 'data_quality': {
                     'financial_indicators_count': len(fundamental_data.get('financial_indicators', {})),
                     'total_news_count': sentiment_analysis.get('total_analyzed', 0),
+                    'sentiment_confidence': sentiment_analysis.get('confidence_score', 0.0),
                     'analysis_completeness': '完整' if len(fundamental_data.get('financial_indicators', {})) >= 15 else '部分'
                 }
             }
+
+            # 保存最近一次数据质量供动态权重使用
+            try:
+                self._last_data_quality = {
+                    'financial_indicators_count': report['data_quality']['financial_indicators_count'],
+                    'total_news_count': report['data_quality']['total_news_count'],
+                    'sentiment_confidence': report['data_quality']['sentiment_confidence']
+                }
+            except Exception:
+                self._last_data_quality = {}
             
             self.logger.info(f"✓ 增强版股票分析完成: {stock_code}")
             self.logger.info(f"  - 财务指标: {len(fundamental_data.get('financial_indicators', {}))} 项")
