@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import time
 import re
+import concurrent.futures
 
 # BaoStock数据接口
 import baostock as bs
@@ -69,6 +70,32 @@ class EnhancedStockAnalyzer:
         
         # 加载配置文件
         self.config = self._load_config()
+
+        # 可选：网络代理设置（用于东财等网络访问不畅场景）
+        try:
+            net = self.config.get('network', {}) if isinstance(self.config, dict) else {}
+            if net.get('enable_proxies'):
+                http_p = net.get('http_proxy') or net.get('HTTP_PROXY')
+                https_p = net.get('https_proxy') or net.get('HTTPS_PROXY')
+                no_p = net.get('no_proxy') or net.get('NO_PROXY')
+                if http_p:
+                    os.environ['HTTP_PROXY'] = str(http_p)
+                if https_p:
+                    os.environ['HTTPS_PROXY'] = str(https_p)
+                if no_p:
+                    os.environ['NO_PROXY'] = str(no_p)
+                self.logger.info("✓ 已应用网络代理配置到环境变量")
+            # 读取资金流接口稳健性配置
+            try:
+                self.fund_flow_timeout_seconds = float(net.get('fund_flow_timeout_seconds', 6.5))
+            except Exception:
+                self.fund_flow_timeout_seconds = 6.5
+            try:
+                self.fund_flow_retries = int(net.get('fund_flow_retries', 3))
+            except Exception:
+                self.fund_flow_retries = 3
+        except Exception as e:
+            self.logger.warning(f"代理配置应用失败: {e}")
         
         # 缓存配置
         cache_config = self.config.get('cache', {})
@@ -93,7 +120,6 @@ class EnhancedStockAnalyzer:
         # 兼容：同时提供 self.weights 引用，便于外部或后续逻辑统一读取
         self.weights = merged_weights
 
-        # 技术阈值配置（允许通过构造函数覆盖）
         default_thresholds = {
             'rsi_overbought': 70.0,
             'rsi_oversold': 30.0,
@@ -130,7 +156,6 @@ class EnhancedStockAnalyzer:
             'temperature': ai_config.get('temperature', 0.7),
             'model_preference': ai_config.get('model_preference', 'openai')
         }
-        
         # 分析参数配置
         params = self.config.get('analysis_params', {})
         self.analysis_params = {
@@ -144,6 +169,356 @@ class EnhancedStockAnalyzer:
         
         self.logger.info("增强版股票分析器初始化完成")
         self._log_config_status()
+
+    # =============================
+    # 市场与代码辅助
+    # =============================
+    def _get_trading_dates(self, start_date: datetime, end_date: datetime) -> List[datetime]:
+        """获取指定日期范围内的A股交易日列表
+        
+        使用简单规则过滤：排除周末（周六日），暂不处理节假日（因K线数据本身已是交易日）
+        实际使用中，从数据源获取的K线数据已经是交易日，此方法主要用于验证和说明
+        """
+        try:
+            trading_dates = []
+            current_date = start_date
+            while current_date <= end_date:
+                # 排除周末（0=周一, 6=周日）
+                if current_date.weekday() < 5:  # 周一到周五
+                    trading_dates.append(current_date)
+                current_date += timedelta(days=1)
+            return trading_dates
+        except Exception as e:
+            self.logger.warning(f"获取交易日历失败: {e}")
+            return []
+
+    def _format_code_for_eastmoney(self, stock_code: str) -> str:
+        """格式化股票代码为Eastmoney需要的前缀格式，如 sh600000 / sz000001 / bj8xxxxx"""
+        try:
+            s = str(stock_code)
+            if s.startswith(('60', '68')):
+                return f"sh{s}"
+            if s.startswith(('00', '30', '20')):
+                return f"sz{s}"
+            if s.startswith(('83', '87', '43')):
+                return f"bj{s}"
+            # 兜底：大概率深市
+            return f"sz{s}"
+        except Exception:
+            return str(stock_code)
+
+    def _detect_board(self, stock_code: str) -> str:
+        """检测板块：Main/SME/ChiNext/STAR/Beijing"""
+        s = str(stock_code)
+        if s.startswith(('600', '601', '603', '605')):
+            return 'Main'
+        if s.startswith('002'):
+            return 'SME'
+        if s.startswith('300'):
+            return 'ChiNext'
+        if s.startswith('688'):
+            return 'STAR'
+        if s.startswith(('83', '87', '43')):
+            return 'Beijing'
+        return 'Other'
+
+    def _estimate_market_cap(self, fundamental_data: dict) -> Optional[float]:
+        """从已获取的估值信息估算总市值（元）。若不可用返回None"""
+        try:
+            val = (fundamental_data or {}).get('valuation') or {}
+            m = val.get('总市值')
+            if m is None:
+                # 有些接口返回单位亿
+                m = val.get('总市值(亿)')
+                if m is not None:
+                    return float(m) * 1e8
+            return float(m) if m is not None else None
+        except Exception:
+            return None
+
+    def _call_with_timeout(self, func, timeout_seconds: float, *args, **kwargs):
+        """在线数据调用的超时保护，避免第三方库在网络不畅时长时间阻塞。
+
+        返回：
+        - 正常：func 的返回值
+        - 超时：特殊对象 TimeoutError('timeout')
+        - 异常：原始异常对象
+        """
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = executor.submit(func, *args, **kwargs)
+        try:
+            return fut.result(timeout=max(0.5, float(timeout_seconds)))
+        except concurrent.futures.TimeoutError:
+            try:
+                self.logger.info(f"调用超时({timeout_seconds}s): {getattr(func, '__name__', 'func')}")
+            except Exception:
+                pass
+            return TimeoutError("timeout")
+        except Exception as e:
+            return e
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    # =============================
+    # 资金流向（近1个月）
+    # =============================
+    def calculate_capital_flow(self, stock_code: str, price_data: pd.DataFrame, fundamental_data: Optional[dict] = None, window_days: int = 30) -> dict:
+        """
+        计算近1个月（按交易日回溯约30天）分档资金流向：超大/大/中/小单净流额合计，主力净流入等。
+
+        返回结构示例：
+        {
+          'window_days': 30,
+          'sum_amount': <总成交额>,
+          'buckets': {
+             'extra_large': {'net': x, 'pos_days': n1, 'neg_days': n2, 'ratio_to_turnover': r1, 'status': '强劲流入/...' },
+             'large': {...},
+             'medium': {...},
+             'small': {...}
+          },
+          'main_force_net': <超大+大净额>,
+          'main_force_ratio_to_turnover': <占总成交额比例>,
+          'status': '主力净流入强/中/弱/净流出',
+          'note': '单位与口径说明'
+        }
+        """
+        result = {
+            'window_days': int(window_days),
+            'buckets': {},
+            'main_force_net': None,
+            'main_force_ratio_to_turnover': None,
+            'status': '数据不足',
+            'sum_amount': None,
+            'note': '',
+            'source': ''
+        }
+
+        try:
+            import akshare as ak
+        except Exception as e:
+            self.logger.info(f"资金流接口不可用(akshare未安装): {e}")
+            result['note'] = 'akshare未安装'
+            return result
+
+        # 获取资金流，带重试
+        df = None
+        em_code = self._format_code_for_eastmoney(stock_code)
+        last_err = None
+        retries = max(1, int(getattr(self, 'fund_flow_retries', 3)))
+        timeout_s = max(1.0, float(getattr(self, 'fund_flow_timeout_seconds', 6.5)))
+        for i in range(retries):
+            try:
+                self.logger.info(f"正在获取近月资金流: {em_code}")
+                # 为避免网络阻塞，增加调用超时保护
+                res = self._call_with_timeout(ak.stock_individual_fund_flow, timeout_s, stock=em_code)
+                if isinstance(res, TimeoutError):
+                    last_err = res
+                elif isinstance(res, Exception):
+                    last_err = res
+                else:
+                    df = res
+                    if df is not None and not getattr(df, 'empty', True):
+                        result['source'] = 'akshare_em'
+                        break
+                    last_err = RuntimeError("空数据")
+            except Exception as e:
+                last_err = e
+            # 退避
+            try:
+                time.sleep(0.6 * (i + 1))
+            except Exception:
+                pass
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            self.logger.info(f"获取资金流失败: {last_err}")
+            result['note'] = f"资金流接口失败:{str(last_err)[:60] if last_err else '未知'}"
+            return result
+
+        if df is None or df.empty:
+            result['note'] = '无资金流数据'
+            return result
+
+        # 解析日期并截取窗口
+        date_col = None
+        for c in ['日期', 'date', df.columns[0]]:
+            if c in df.columns:
+                date_col = c
+                break
+        try:
+            df['_dt'] = pd.to_datetime(df[date_col], errors='coerce')
+        except Exception:
+            df['_dt'] = pd.NaT
+        cutoff = datetime.now() - timedelta(days=max(7, int(window_days)))
+        df = df[df['_dt'] >= cutoff]
+        if df.empty:
+            result['note'] = '窗口内无数据'
+            return result
+
+        # 列名映射，兼容不同字段
+        def pick(*cands):
+            for c in cands:
+                if c in df.columns:
+                    return c
+            return None
+
+        cols = {
+            'xd_net': pick('超大单净流入-净额', '超大单-净额', 'xl_net'),
+            'xl_ratio': pick('超大单净流入-净占比', '超大单-净占比', 'xl_ratio'),
+            'lg_net': pick('大单净流入-净额', '大单-净额', 'lg_net'),
+            'lg_ratio': pick('大单净流入-净占比', '大单-净占比', 'lg_ratio'),
+            'md_net': pick('中单净流入-净额', '中单-净额', 'md_net'),
+            'md_ratio': pick('中单净流入-净占比', '中单-净占比', 'md_ratio'),
+            'sm_net': pick('小单净流入-净额', '小单-净额', 'sm_net'),
+            'sm_ratio': pick('小单净流入-净占比', '小单-净占比', 'sm_ratio'),
+        }
+
+        # 数值化
+        for key, c in cols.items():
+            if c and c in df.columns:
+                try:
+                    df[key] = pd.to_numeric(df[c], errors='coerce')
+                except Exception:
+                    df[key] = np.nan
+            else:
+                df[key] = np.nan
+
+        # 计算窗口内合计净额与天数
+        def agg_bucket(net_col: str):
+            s = df[net_col].dropna()
+            net = float(s.sum()) if len(s) else 0.0
+            pos_days = int((s > 0).sum()) if len(s) else 0
+            neg_days = int((s < 0).sum()) if len(s) else 0
+            return net, pos_days, neg_days
+
+        xd_net, xd_pos, xd_neg = agg_bucket('xd_net')
+        lg_net, lg_pos, lg_neg = agg_bucket('lg_net')
+        md_net, md_pos, md_neg = agg_bucket('md_net')
+        sm_net, sm_pos, sm_neg = agg_bucket('sm_net')
+
+        # 计算成交额基准（来自价格数据的 amount 列，BaoStock为交易额）
+        try:
+            if price_data is not None and not price_data.empty and 'amount' in price_data.columns:
+                p = price_data.copy()
+                p['_dt'] = pd.to_datetime(p.get('date', p.index), errors='coerce')
+                p = p[p['_dt'] >= cutoff]
+                sum_amount = float(pd.to_numeric(p['amount'], errors='coerce').dropna().sum()) if not p.empty else np.nan
+            else:
+                sum_amount = np.nan
+        except Exception:
+            sum_amount = np.nan
+
+        result['sum_amount'] = None if not np.isfinite(sum_amount) else float(sum_amount)
+
+        # 比例（对总成交额），若成交额不可用则仅返回净额
+        def ratio(v):
+            if np.isfinite(sum_amount) and sum_amount > 0:
+                return float(v / sum_amount)
+            return None
+
+        result['buckets'] = {
+            'extra_large': {
+                'net': float(xd_net), 'pos_days': xd_pos, 'neg_days': xd_neg, 'ratio_to_turnover': ratio(xd_net)
+            },
+            'large': {
+                'net': float(lg_net), 'pos_days': lg_pos, 'neg_days': lg_neg, 'ratio_to_turnover': ratio(lg_net)
+            },
+            'medium': {
+                'net': float(md_net), 'pos_days': md_pos, 'neg_days': md_neg, 'ratio_to_turnover': ratio(md_net)
+            },
+            'small': {
+                'net': float(sm_net), 'pos_days': sm_pos, 'neg_days': sm_neg, 'ratio_to_turnover': ratio(sm_net)
+            }
+        }
+
+        # 主力（超大+大）
+        main_net = float((xd_net if np.isfinite(xd_net) else 0.0) + (lg_net if np.isfinite(lg_net) else 0.0))
+        result['main_force_net'] = main_net
+        result['main_force_ratio_to_turnover'] = ratio(main_net)
+
+        # 根据板块与体量动态阈值打分/评级
+        board = self._detect_board(stock_code)
+        # 基础阈值（占成交额比例）
+        th_strong = 0.08
+        th_mid = 0.03
+        th_weak = 0.01
+        # 板块缩放
+        scale = 1.0
+        if board in ('ChiNext', 'STAR'):
+            scale = 0.7
+        elif board == 'SME':
+            scale = 0.8
+        elif board == 'Beijing':
+            scale = 0.6
+
+        # 体量缩放（市值小的更容易达到强度门槛）
+        try:
+            mktcap = self._estimate_market_cap(fundamental_data or {})
+            if mktcap is not None:
+                if mktcap < 1e10:      # < 100亿
+                    scale *= 0.7
+                elif mktcap < 4e10:   # 100-400亿
+                    scale *= 0.85
+                elif mktcap > 2e11:   # > 2000亿
+                    scale *= 1.15
+        except Exception:
+            pass
+
+        th_strong *= scale
+        th_mid *= scale
+        th_weak *= scale
+
+        # 天数占比
+        total_days = int(len(df))
+        pos_ratio_main = float((xd_pos + lg_pos) / total_days) if total_days > 0 else 0.0
+
+        def label_status(ratio_val: Optional[float], pos_ratio: float) -> str:
+            if ratio_val is None:
+                # 用净额方向兜底
+                r = main_net
+                if r > 0:
+                    return '净流入(无法估算强度)'
+                elif r < 0:
+                    return '净流出'
+                else:
+                    return '持平'
+            if ratio_val >= th_strong and pos_ratio >= 0.6:
+                return '主力净流入强'
+            if ratio_val >= th_mid and pos_ratio >= 0.5:
+                return '主力净流入中'
+            if ratio_val >= th_weak and pos_ratio >= 0.4:
+                return '主力净流入弱'
+            if ratio_val <= -th_mid:
+                return '主力净流出较强'
+            if ratio_val < 0:
+                return '主力净流出'
+            return '主力资金趋于中性'
+
+        result['status'] = label_status(result['main_force_ratio_to_turnover'], pos_ratio_main)
+
+        # 单桶状态
+        def bucket_label(v_net: float, v_ratio: Optional[float], pos_days: int) -> str:
+            if v_ratio is None:
+                return '净流入' if v_net > 0 else ('净流出' if v_net < 0 else '持平')
+            if v_ratio >= th_strong * 0.6 and pos_days >= max(6, total_days // 3):
+                return '强'
+            if v_ratio >= th_mid * 0.6 and pos_days >= max(5, total_days // 4):
+                return '中'
+            if v_ratio >= th_weak * 0.5 and pos_days >= max(4, total_days // 5):
+                return '弱'
+            if v_ratio < 0:
+                return '流出'
+            return '中性'
+
+        for k in ['extra_large', 'large', 'medium', 'small']:
+            b = result['buckets'][k]
+            b['status'] = bucket_label(b['net'], b['ratio_to_turnover'], b['pos_days'])
+
+        result['note'] = '资金净额按东财口径，近约30自然日内的交易日累计；比例以同期成交额估算（若可用）'
+        return result
+
+        
 
     def _load_config(self):
         """加载JSON配置文件"""
@@ -167,7 +542,6 @@ class EnhancedStockAnalyzer:
                 backup_name = f"{self.config_file}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 os.rename(self.config_file, backup_name)
                 self.logger.info(f"错误配置文件已备份为: {backup_name}")
-            
             default_config = self._get_default_config()
             self._save_config(default_config)
             return default_config
@@ -177,7 +551,6 @@ class EnhancedStockAnalyzer:
             return self._get_default_config()
 
     def _get_default_config(self):
-        """获取默认配置"""
         return {
             "api_keys": {
                 "openai": "",
@@ -225,6 +598,13 @@ class EnhancedStockAnalyzer:
                 "price_hours": 1,
                 "fundamental_hours": 6,
                 "news_hours": 2
+            },
+            "network": {
+                "snapshot_cache_ttl_hours": 4,
+                "enable_proxies": False,
+                "http_proxy": "",
+                "https_proxy": "",
+                "no_proxy": ""
             },
             "streaming": {
                 "enabled": True,
@@ -338,12 +718,11 @@ class EnhancedStockAnalyzer:
             return pd.DataFrame()
 
     def __del__(self):
-        """析构函数，确保BaoStock连接被正确关闭"""
+        """析构函数：不再在此处调用全局 bs.logout()，避免影响其他实例或在用会话。"""
         try:
-            if hasattr(self, 'baostock_connected') and self.baostock_connected:
-                bs.logout()
-                self.logger.info("BaoStock连接已关闭")
-        except:
+            # 仅记录，不主动登出（BaoStock为进程级会话，交由显式生命周期管理或进程结束）
+            self.logger.debug("Analyzer 实例销毁")
+        except Exception:
             pass
 
     # =============================
@@ -406,6 +785,96 @@ class EnhancedStockAnalyzer:
             return [w / s if s > 0 else 0.0 for w in weights]
         except Exception:
             return [1.0 / max(1, len(dates))] * max(1, len(dates))
+
+    # ===== 快照缓存辅助 =====
+    def _snapshot_cache_path(self) -> str:
+        try:
+            cache_dir = os.path.dirname(os.path.abspath(self.config_file)) or os.getcwd()
+        except Exception:
+            cache_dir = os.getcwd()
+        return os.path.join(cache_dir, 'spot_snapshot_cache.csv')
+
+    def _snapshot_cache_ttl(self) -> timedelta:
+        try:
+            net = self.config.get('network', {}) if isinstance(self.config, dict) else {}
+            hours = float(net.get('snapshot_cache_ttl_hours', 4))
+            return timedelta(hours=max(0.5, min(24.0, hours)))
+        except Exception:
+            return timedelta(hours=4)
+
+    def _load_spot_snapshot_cache(self) -> pd.DataFrame:
+        path = self._snapshot_cache_path()
+        try:
+            if not os.path.exists(path):
+                return pd.DataFrame()
+            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+            if datetime.now() - mtime > self._snapshot_cache_ttl():
+                return pd.DataFrame()
+            df = pd.read_csv(path)
+            return df if df is not None else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def _save_spot_snapshot_cache(self, df: pd.DataFrame):
+        try:
+            if df is None or df.empty:
+                return
+            path = self._snapshot_cache_path()
+            # 仅保留常用列，减小体积
+            keep_cols = [c for c in df.columns if c in ['代码','名称','涨跌幅','最新价','总市值','总市值(亿)','市盈率','市盈率-动态','市盈率TTM','市净率','股息率TTM(%)','股息率TTM','股息率']]
+            df_to_save = df[keep_cols] if keep_cols else df
+            df_to_save.to_csv(path, index=False)
+            self.logger.info("✓ 估值快照已写入本地缓存")
+        except Exception as e:
+            self.logger.debug(f"写入快照缓存失败: {e}")
+
+    # ===== 行业成份缓存辅助 =====
+    def _industry_cache_dir(self) -> str:
+        try:
+            base = os.path.dirname(os.path.abspath(self.config_file)) or os.getcwd()
+        except Exception:
+            base = os.getcwd()
+        path = os.path.join(base, 'industry_cons_cache')
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _industry_cons_cache_path(self, industry_name: str) -> str:
+        safe = re.sub(r"[^\w\u4e00-\u9fa5]+", "_", str(industry_name or 'unknown'))[:40]
+        return os.path.join(self._industry_cache_dir(), f"{safe}.csv")
+
+    def _industry_cons_cache_ttl(self) -> timedelta:
+        try:
+            net = self.config.get('network', {}) if isinstance(self.config, dict) else {}
+            days = float(net.get('industry_cache_ttl_days', 7))
+            return timedelta(days=max(1.0, min(30.0, days)))
+        except Exception:
+            return timedelta(days=7)
+
+    def _load_industry_cons_cache(self, industry_name: str) -> pd.DataFrame:
+        path = self._industry_cons_cache_path(industry_name)
+        try:
+            if not os.path.exists(path):
+                return pd.DataFrame()
+            mtime = datetime.fromtimestamp(os.path.getmtime(path))
+            if datetime.now() - mtime > self._industry_cons_cache_ttl():
+                return pd.DataFrame()
+            df = pd.read_csv(path)
+            return df if df is not None else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    def _save_industry_cons_cache(self, industry_name: str, df: pd.DataFrame):
+        try:
+            if df is None or df.empty:
+                return
+            path = self._industry_cons_cache_path(industry_name)
+            # 仅保留常见列
+            keep = [c for c in df.columns if c in ['代码','名称','股票代码','证券代码','股票简称','名称_x','名称_y']]
+            df_to_save = df[keep] if keep else df
+            df_to_save.to_csv(path, index=False)
+            self.logger.info(f"✓ 行业成份缓存已写入: {os.path.basename(path)}")
+        except Exception as e:
+            self.logger.debug(f"写入行业缓存失败: {e}")
 
     def _tokenize_cn(self, text: str) -> List[str]:
         """中文优先的轻量分词，优先使用jieba，不可用时回退到简单拆分"""
@@ -470,74 +939,52 @@ class EnhancedStockAnalyzer:
         return float(np.tanh(score / max(1.0, hits)))
 
     def get_stock_data(self, stock_code, period='1y'):
-        """获取股票价格数据 - 优先使用BaoStock"""
+        """获取股票价格数据 - 优先使用BaoStock，失败回退到akshare；带缓存"""
+        # 缓存命中
         if stock_code in self.price_cache:
             cache_time, data = self.price_cache[stock_code]
             if datetime.now() - cache_time < self.cache_duration:
                 self.logger.info(f"使用缓存的价格数据: {stock_code}")
                 return data
 
-        # 首先尝试使用BaoStock
-        try:
-            if self.baostock_connected:
-                return self._get_stock_data_from_baostock(stock_code, period)
-        except Exception as e:
-            self.logger.warning(f"BaoStock获取数据失败，尝试使用akshare: {e}")
+        # BaoStock 优先
+        if self.baostock_connected:
+            try:
+                end_date = datetime.now().strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=self.analysis_params.get('technical_period_days', 365))).strftime('%Y-%m-%d')
+                formatted_code = self._format_stock_code_for_baostock(stock_code)
 
-        # 备用方案：使用akshare
-        try:
-            return self._get_stock_data_from_akshare(stock_code, period)
-        except Exception as e:
-            self.logger.error(f"所有数据源均失败: {e}")
-            raise ValueError(f"无法获取股票 {stock_code} 的数据")
+                self.logger.info(f"正在从BaoStock获取 {stock_code} 的历史数据...")
+                rs = bs.query_history_k_data_plus(
+                    code=formatted_code,
+                    fields="date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,pctChg,isST",
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency="d",
+                    adjustflag="2"
+                )
+                if rs.error_code != '0':
+                    raise Exception(rs.error_msg)
 
-    def _get_stock_data_from_baostock(self, stock_code, period='1y'):
-        """使用BaoStock获取股票价格数据"""
-        try:
-            # 计算时间范围
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=self.analysis_params['technical_period_days'])).strftime('%Y-%m-%d')
-            
-            # 格式化股票代码
-            formatted_code = self._format_stock_code_for_baostock(stock_code)
-            
-            self.logger.info(f"正在从BaoStock获取 {stock_code} 的历史数据...")
-            
-            # 查询日线数据
-            rs = bs.query_history_k_data_plus(
-                formatted_code,
-                "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="3"  # 3表示后复权
-            )
-            
-            if rs.error_code != '0':
-                raise Exception(f"BaoStock查询失败: {rs.error_msg}")
-            
-            # 转换为DataFrame
-            data_list = []
-            while (rs.error_code == '0') & rs.next():
-                data_list.append(rs.get_row_data())
-            
-            if not data_list:
-                raise ValueError(f"BaoStock未返回数据")
-            
-            stock_data = pd.DataFrame(data_list, columns=rs.fields)
-            
-            # 数据预处理
-            stock_data = self._preprocess_baostock_data(stock_data, stock_code)
-            
-            # 缓存数据
-            self.price_cache[stock_code] = (datetime.now(), stock_data)
-            self.logger.info(f"✓ 成功从BaoStock获取 {stock_code} 的价格数据，共 {len(stock_data)} 条记录")
-            
-            return stock_data
-            
-        except Exception as e:
-            self.logger.error(f"BaoStock获取数据失败: {e}")
-            raise
+                data_list = []
+                while (rs.error_code == '0') & rs.next():
+                    data_list.append(rs.get_row_data())
+                if not data_list:
+                    raise ValueError("BaoStock未返回数据")
+
+                stock_data = pd.DataFrame(data_list, columns=rs.fields)
+                stock_data = self._preprocess_baostock_data(stock_data, stock_code)
+
+                # 缓存
+                self.price_cache[stock_code] = (datetime.now(), stock_data)
+                self.logger.info(f"✓ 成功从BaoStock获取 {stock_code} 的价格数据，共 {len(stock_data)} 条记录")
+                return stock_data
+            except Exception as e:
+                self.logger.warning(f"BaoStock价格数据失败，将回退akshare: {e}")
+
+        # 回退到 akshare
+        data = self._get_stock_data_from_akshare(stock_code, period)
+        return data
 
     def _preprocess_baostock_data(self, stock_data, stock_code):
         """预处理BaoStock数据"""
@@ -882,6 +1329,9 @@ class EnhancedStockAnalyzer:
                     # 利润表数据
                     income_statement = ak.stock_financial_abstract_ths(symbol=stock_code, indicator="按报告期")
                     if income_statement is not None and not income_statement.empty:
+                        if self._is_data_stale(income_statement, ['报告期','发布日期','date'], max_days=540, what='利润表'):
+                            income_statement = pd.DataFrame()
+                    if income_statement is not None and not income_statement.empty:
                         latest_income = income_statement.iloc[0].to_dict()
                         financial_indicators.update(latest_income)
                 except Exception as e:
@@ -891,6 +1341,9 @@ class EnhancedStockAnalyzer:
                     # 财务分析指标
                     balance_sheet = ak.stock_financial_analysis_indicator(symbol=stock_code)
                     if balance_sheet is not None and not balance_sheet.empty:
+                        if self._is_data_stale(balance_sheet, ['日期','报告期','date'], max_days=540, what='财务分析指标'):
+                            balance_sheet = pd.DataFrame()
+                    if balance_sheet is not None and not balance_sheet.empty:
                         latest_balance = balance_sheet.iloc[-1].to_dict()
                         financial_indicators.update(latest_balance)
                 except Exception as e:
@@ -899,6 +1352,9 @@ class EnhancedStockAnalyzer:
                 try:
                     # 现金流量表 - 修复None检查
                     cash_flow = ak.stock_cash_flow_sheet_by_report_em(symbol=stock_code)
+                    if cash_flow is not None and not cash_flow.empty:
+                        if self._is_data_stale(cash_flow, ['报告期','公告日期','date'], max_days=540, what='现金流量表'):
+                            cash_flow = pd.DataFrame()
                     if cash_flow is not None and not cash_flow.empty:
                         latest_cash = cash_flow.iloc[-1].to_dict()
                         financial_indicators.update(latest_cash)
@@ -921,24 +1377,54 @@ class EnhancedStockAnalyzer:
             # 3. 估值指标 - 使用更稳定的API
             try:
                 self.logger.info("正在获取估值指标...")
-                # 尝试使用替代的估值指标API
                 try:
-                    valuation_data = ak.stock_a_indicator_lg(symbol=stock_code)
-                except AttributeError:
-                    # 如果上述方法不存在，尝试其他方法
+                    spot = ak.stock_zh_a_spot_em()
+                    if spot is not None and not spot.empty:
+                        self._save_spot_snapshot_cache(spot)
+                except Exception as _e:
+                    self.logger.info("ℹ️ 在线估值快照获取失败，尝试使用本地缓存")
+                    spot = self._load_spot_snapshot_cache()
+                if spot is not None and not spot.empty:
                     try:
-                        valuation_data = ak.tool_trade_date_hist_sina()  # 使用可用的方法作为替代
-                        valuation_data = pd.DataFrame()  # 设为空DataFrame
-                    except:
-                        valuation_data = pd.DataFrame()
-                        
-                if valuation_data is not None and not valuation_data.empty:
-                    latest_valuation = valuation_data.iloc[-1].to_dict()
-                    fundamental_data['valuation'] = latest_valuation
-                    self.logger.info("✓ 估值指标获取成功")
+                        row = spot[spot['代码'].astype(str) == str(stock_code)]
+                        if not row.empty:
+                            r = row.iloc[0]
+                            def pick(*names):
+                                for n in names:
+                                    if n in row.columns:
+                                        return r.get(n)
+                                return None
+                            pe = pick('市盈率-动态','市盈率TTM','市盈率')
+                            pb = pick('市净率')
+                            mktcap = pick('总市值','总市值(亿)')
+                            divy = pick('股息率TTM(%)','股息率TTM','股息率')
+                            # 规范化
+                            def to_float(x):
+                                try:
+                                    if isinstance(x, str) and x.endswith('%'):
+                                        return float(x.strip('%'))
+                                    return float(x)
+                                except Exception:
+                                    return None
+                            valuation = {
+                                '市盈率': to_float(pe),
+                                '市净率': to_float(pb),
+                                '总市值': to_float(mktcap),
+                                '股息收益率': to_float(divy)
+                            }
+                            # 去除None
+                            valuation = {k: v for k, v in valuation.items() if v is not None}
+                            fundamental_data['valuation'] = valuation
+                            self.logger.info("✓ 估值指标获取成功(快照)")
+                        else:
+                            fundamental_data['valuation'] = {}
+                            self.logger.info("ℹ️ 未在快照中找到该代码")
+                    except Exception as e2:
+                        self.logger.warning(f"处理估值快照失败: {e2}")
+                        fundamental_data['valuation'] = {}
                 else:
                     fundamental_data['valuation'] = {}
-                    self.logger.info("ℹ️ 估值指标暂时不可用")
+                    self.logger.info("ℹ️ 估值快照不可用")
             except Exception as e:
                 self.logger.warning(f"获取估值指标失败: {e}")
                 fundamental_data['valuation'] = {}
@@ -946,50 +1432,166 @@ class EnhancedStockAnalyzer:
             # 4. 业绩预告和业绩快报
             try:
                 self.logger.info("正在获取业绩预告...")
-                # 尝试使用正确的业绩预告API
+                perf_items = []
+                def _filter_by_code(df):
+                    if df is None or df.empty:
+                        return df
+                    cols = [c for c in df.columns if str(c) in ('代码','股票代码','证券代码')] or [c for c in df.columns if '码' in str(c)] or [df.columns[0]]
+                    col = cols[0]
+                    s = df[col].astype(str)
+                    mask = s.str.endswith(str(stock_code)) | s.str.contains(str(stock_code), na=False)
+                    return df[mask]
+                # 先尝试业绩预告
                 try:
-                    performance_forecast = ak.stock_yjbb_em(stock=stock_code)  # 修正参数名
-                except (AttributeError, TypeError):
-                    # 如果方法不存在或参数错误，尝试其他方法
+                    yjyg = ak.stock_yjyg_em()
+                    if yjyg is not None and not yjyg.empty:
+                        df = _filter_by_code(yjyg)
+                        # 按公告日期倒序
+                        date_col = '公告日期' if '公告日期' in df.columns else ('最新公告日期' if '最新公告日期' in df.columns else None)
+                        if date_col:
+                            df = df.sort_values(by=date_col, ascending=False)
+                        for _, r in df.head(10).iterrows():
+                            item = {
+                                'date': str(r.get('公告日期') or r.get('最新公告日期') or r.get('公告时间') or ''),
+                                'type': '业绩预告',
+                                'range': str(r.get('预告类型') or r.get('变动幅度') or r.get('预告净利润变动幅度') or ''),
+                                'reason': str(r.get('变动原因') or ''),
+                                'profit_low': str(r.get('预测净利润下限') or r.get('预告净利润下限') or ''),
+                                'profit_high': str(r.get('预测净利润上限') or r.get('预告净利润上限') or ''),
+                                'eps': str(r.get('每股收益') or r.get('基本每股收益') or ''),
+                            }
+                            perf_items.append(item)
+                except Exception as e:
+                    self.logger.info(f"业绩预告接口不可用: {e}")
+                # 再尝试业绩快报
+                if not perf_items:
                     try:
-                        performance_forecast = ak.stock_yjbb_em()  # 不传参数
-                        if performance_forecast is not None and not performance_forecast.empty:
-                            # 筛选出对应股票的数据
-                            performance_forecast = performance_forecast[
-                                performance_forecast.iloc[:, 0].astype(str).str.contains(stock_code, na=False)
-                            ]
-                    except:
-                        performance_forecast = pd.DataFrame()
-                        
-                if performance_forecast is not None and not performance_forecast.empty:
-                    fundamental_data['performance_forecast'] = performance_forecast.head(10).to_dict('records')
-                    self.logger.info("✓ 业绩预告获取成功")
+                        yjkb = ak.stock_yjkb_em()
+                        if yjkb is not None and not yjkb.empty:
+                            df = _filter_by_code(yjkb)
+                            date_col = '公告日期' if '公告日期' in df.columns else ('最新公告日期' if '最新公告日期' in df.columns else None)
+                            if date_col:
+                                df = df.sort_values(by=date_col, ascending=False)
+                            for _, r in df.head(10).iterrows():
+                                item = {
+                                    'date': str(r.get('公告日期') or r.get('最新公告日期') or r.get('公告时间') or ''),
+                                    'type': '业绩快报',
+                                    'revenue': str(r.get('营业总收入') or r.get('营业收入') or ''),
+                                    'net_profit': str(r.get('净利润') or r.get('归母净利润') or ''),
+                                    'eps': str(r.get('每股收益') or r.get('基本每股收益') or ''),
+                                    'yoy_revenue': str(r.get('营业总收入同比增长') or r.get('营业收入同比增长') or ''),
+                                    'yoy_netprofit': str(r.get('净利润同比增长') or r.get('归母净利润同比增长') or ''),
+                                }
+                                perf_items.append(item)
+                    except Exception as e:
+                        self.logger.info(f"业绩快报接口不可用: {e}")
+                fundamental_data['performance_forecast'] = perf_items[:10]
+                if perf_items:
+                    self.logger.info("✓ 业绩预告/快报获取成功")
                 else:
-                    fundamental_data['performance_forecast'] = []
                     self.logger.info("ℹ️ 业绩预告暂时不可用")
             except Exception as e:
                 self.logger.warning(f"获取业绩预告失败: {e}")
                 fundamental_data['performance_forecast'] = []
             
-            # 5. 分红配股信息
+            # 5. 分红配股信息 - 优先使用BaoStock
             try:
                 self.logger.info("正在获取分红配股信息...")
-                # 尝试使用正确的分红配股API
-                try:
-                    dividend_info = ak.stock_fhpg_em(symbol=stock_code)
-                except AttributeError:
-                    # 如果方法不存在，尝试其他方法
+                dividend_info_list = []
+                
+                # 首先尝试BaoStock分红数据（推荐）
+                if self.baostock_connected:
                     try:
-                        dividend_info = ak.stock_fhpg_detail_em(symbol=stock_code)
-                    except:
-                        dividend_info = pd.DataFrame()
+                        formatted_code = self._format_stock_code_for_baostock(stock_code)
                         
-                if dividend_info is not None and not dividend_info.empty:
-                    fundamental_data['dividend_info'] = dividend_info.head(10).to_dict('records')
-                    self.logger.info("✓ 分红配股信息获取成功")
-                else:
-                    fundamental_data['dividend_info'] = []
-                    self.logger.info("ℹ️ 分红配股信息暂时不可用")
+                        # 获取最近3年的分红数据
+                        current_year = datetime.now().year
+                        for year in [current_year, current_year-1, current_year-2]:
+                            rs_dividend = bs.query_dividend_data(
+                                code=formatted_code,
+                                year=year,
+                                yearType="report"
+                            )
+                            
+                            if rs_dividend.error_code == '0':
+                                dividend_data = []
+                                while (rs_dividend.error_code == '0') & rs_dividend.next():
+                                    dividend_data.append(rs_dividend.get_row_data())
+                                
+                                if dividend_data:
+                                    df_dividend = pd.DataFrame(dividend_data, columns=rs_dividend.fields)
+                                    # 转换为标准格式，使用正确的字段名
+                                    for _, row in df_dividend.iterrows():
+                                        dividend_item = {
+                                            'year': str(year),  # 使用查询的年份
+                                            'dividend_per_share': str(row.get('dividCashPsBeforeTax', '0')),
+                                            'dividend_after_tax': str(row.get('dividCashPsAfterTax', '0')),
+                                            'dividend_type': '现金分红',
+                                            'announcement_date': str(row.get('dividPlanAnnounceDate', '')),
+                                            'record_date': str(row.get('dividRegistDate', '')),
+                                            'ex_dividend_date': str(row.get('dividOperateDate', '')),
+                                            'pay_date': str(row.get('dividPayDate', '')),
+                                            'dividend_description': str(row.get('dividCashStock', '')),
+                                            'source': 'BaoStock'
+                                        }
+                                        dividend_info_list.append(dividend_item)
+                        
+                        if dividend_info_list:
+                            dividend_info_list = self._normalize_dividend_records(dividend_info_list)
+                            dividend_info_list = sorted(dividend_info_list, key=lambda x: str(x.get('year','')), reverse=True)
+                            fundamental_data['dividend_info'] = dividend_info_list
+                            self.logger.info(f"✓ BaoStock获取分红配股信息成功，共{len(dividend_info_list)}条")
+                        else:
+                            self.logger.info("✓ BaoStock查询完成，该股票暂无分红记录")
+                            fundamental_data['dividend_info'] = []
+                    
+                    except Exception as e:
+                        self.logger.warning(f"BaoStock获取分红数据失败: {e}")
+                        dividend_info_list = []
+                
+                # 如果BaoStock没有获取到数据，尝试akshare作为备用
+                if not dividend_info_list:
+                    try:
+                        # 尝试akshare的分红数据API
+                        dividend_apis = [
+                            ('stock_dividend_cninfo', lambda: ak.stock_dividend_cninfo(symbol=stock_code)),
+                            ('stock_history_dividend_detail', lambda: ak.stock_history_dividend_detail(symbol=stock_code)),
+                        ]
+                        
+                        for api_name, api_func in dividend_apis:
+                            try:
+                                dividend_data = api_func()
+                                if dividend_data is not None and not dividend_data.empty:
+                                    # 转换akshare数据格式
+                                    for _, row in dividend_data.head(10).iterrows():
+                                        dividend_item = {
+                                            'year': str(row.iloc[0] if len(row) > 0 else ''),
+                                            'dividend_per_share': str(row.iloc[1] if len(row) > 1 else '0'),
+                                            'dividend_type': str(row.iloc[2] if len(row) > 2 else '分红'),
+                                            'announcement_date': str(row.iloc[3] if len(row) > 3 else ''),
+                                            'record_date': str(row.iloc[4] if len(row) > 4 else ''),
+                                            'ex_dividend_date': str(row.iloc[5] if len(row) > 5 else ''),
+                                            'source': f'akshare_{api_name}'
+                                        }
+                                        dividend_info_list.append(dividend_item)
+                                    # 标准化与排序
+                                    dividend_info_list = self._normalize_dividend_records(dividend_info_list)
+                                    dividend_info_list = sorted(dividend_info_list, key=lambda x: str(x.get('year','')), reverse=True)
+                                    fundamental_data['dividend_info'] = dividend_info_list
+                                    self.logger.info(f"✓ akshare({api_name})获取分红配股信息成功，共{len(dividend_info_list)}条")
+                                    break
+                            except Exception as e:
+                                self.logger.warning(f"akshare {api_name} 获取分红数据失败: {e}")
+                                continue
+                        
+                        if not dividend_info_list:
+                            fundamental_data['dividend_info'] = []
+                            self.logger.info("ℹ️ 分红配股信息暂时不可用")
+                    
+                    except Exception as e:
+                        self.logger.warning(f"akshare获取分红配股信息失败: {e}")
+                        fundamental_data['dividend_info'] = []
+                
             except Exception as e:
                 self.logger.warning(f"获取分红配股信息失败: {e}")
                 fundamental_data['dividend_info'] = []
@@ -1105,54 +1707,235 @@ class EnhancedStockAnalyzer:
             return {}
 
     def _get_industry_analysis(self, stock_code):
-        """获取行业分析数据"""
+        """获取行业分析数据（含同业对比与排名）"""
         try:
             import akshare as ak
-            
+            import difflib
             industry_data = {}
-            
-            # 获取行业信息
+
+            # 获取基本行业归属
             try:
-                industry_info = ak.stock_board_industry_name_em()
-                stock_industry = industry_info[industry_info.iloc[:, 0].astype(str).str.contains(stock_code, na=False)]
-                if not stock_industry.empty:
-                    industry_data['industry_info'] = stock_industry.iloc[0].to_dict()
-                else:
-                    industry_data['industry_info'] = {}
+                info = ak.stock_individual_info_em(symbol=stock_code)
+                industry_name = None
+                if info is not None and not info.empty:
+                    m = dict(zip(info['item'], info['value']))
+                    industry_name = m.get('所属行业') or m.get('行业')
+                # 主口径（东财）的行业名
+                primary = industry_name or ''
+                industry_data['industry_name'] = primary  # 兼容旧字段
+                industry_data['industry_name_primary'] = primary
+                # 预置多口径信息占位
+                industry_data['baostock_industry_name'] = ''
+                industry_data['industry_source'] = ''
+                industry_data['resolved_em_name'] = ''
+                industry_data['industry_tags'] = []
             except Exception as e:
-                self.logger.warning(f"获取行业信息失败: {e}")
-                industry_data['industry_info'] = {}
-            
-            # 获取行业排名
+                self.logger.warning(f"获取行业归属失败: {e}")
+                industry_data['industry_name'] = ''
+                industry_data['industry_name_primary'] = ''
+                industry_data['baostock_industry_name'] = ''
+                industry_data['industry_source'] = ''
+                industry_data['resolved_em_name'] = ''
+                industry_data['industry_tags'] = []
+
+            # 获取行业成份并做同业对比
+            peers = []
             try:
-                # 尝试使用正确的行业排名API
-                try:
-                    industry_rank = ak.stock_rank_em(symbol="行业排名")
-                except AttributeError:
-                    # 如果方法不存在，使用替代方法
+                # 根据行业名称解析为Eastmoney可识别名称
+                def _resolve_em_industry_name(name: str) -> str:
+                    if not isinstance(name, str) or not name.strip():
+                        return ''
                     try:
-                        # 尝试获取行业板块数据
-                        industry_rank = ak.stock_board_industry_name_em()
-                        # 查找包含股票代码的行业信息
-                        industry_rank = pd.DataFrame()  # 暂时设为空
-                    except:
-                        industry_rank = pd.DataFrame()
-                        
-                if not industry_rank.empty:
-                    stock_rank = industry_rank[industry_rank.iloc[:, 1].astype(str).str.contains(stock_code, na=False)]
-                    if not stock_rank.empty:
-                        industry_data['industry_rank'] = stock_rank.iloc[0].to_dict()
+                        df_names = ak.stock_board_industry_name_em()
+                    except Exception:
+                        df_names = pd.DataFrame()
+                    if df_names is None or df_names.empty:
+                        return name
+                    # 取可能的名称列
+                    cand_cols = [c for c in ['板块名称','名称','行业名称','行业'] if c in df_names.columns]
+                    name_col = cand_cols[0] if cand_cols else df_names.columns[0]
+                    pool = [str(x) for x in df_names[name_col].dropna().unique().tolist()]
+                    # 1) 精确匹配
+                    if name in pool:
+                        return name
+                    # 2) 子串匹配（双向）
+                    subs = [p for p in pool if (name in p) or (p in name)]
+                    if subs:
+                        return subs[0]
+                    # 3) 相似度匹配
+                    m = difflib.get_close_matches(name, pool, n=1, cutoff=0.6)
+                    if m:
+                        return m[0]
+                    return name
+
+                if industry_data['industry_name']:
+                    em_name = _resolve_em_industry_name(industry_data['industry_name'])
+                    industry_data['resolved_em_name'] = em_name
+                    cons = pd.DataFrame()
+                    # 先尝试EM口径
+                    try:
+                        cons = ak.stock_board_industry_cons_em(symbol=em_name)
+                        if cons is not None and not cons.empty:
+                            industry_data['industry_source'] = 'EM'
+                    except Exception as e_em:
+                        self.logger.info(f"ℹ️ EM行业成份获取失败({e_em})，尝试THS口径")
+                    # 兜底：尝试同花顺口径
+                    if (cons is None or cons.empty):
+                        try:
+                            cons = ak.stock_board_industry_cons_ths(symbol=em_name)
+                            if cons is not None and not cons.empty and not industry_data.get('industry_source'):
+                                industry_data['industry_source'] = 'THS'
+                        except Exception as e_ths:
+                            self.logger.info(f"ℹ️ THS行业成份获取失败({e_ths})")
+                    # 若仍为空，尝试从缓存读取
+                    if (cons is None or cons.empty):
+                        cache_df = self._load_industry_cons_cache(em_name)
+                        if cache_df is not None and not cache_df.empty:
+                            cons = cache_df
+                            self.logger.info("ℹ️ 使用本地行业成份缓存")
+                            if not industry_data.get('industry_source'):
+                                industry_data['industry_source'] = 'Cache'
+                else:
+                    cons = pd.DataFrame()
+                if cons is not None and not cons.empty:
+                    # 成功则写入缓存
+                    try:
+                        self._save_industry_cons_cache(em_name, cons)
+                    except Exception:
+                        pass
+                # 进一步兜底：使用BaoStock行业分类构造成份列表
+                if (cons is None or cons.empty) and getattr(self, 'baostock_connected', False):
+                    try:
+                        # 获取全市场行业分类
+                        dt = datetime.now().strftime('%Y-%m-%d')
+                        df_ind = self._query_baostock_data(bs.query_stock_industry, date=dt)
+                        if (df_ind is None or df_ind.empty):
+                            df_ind = self._query_baostock_data(bs.query_stock_industry)
+                        if df_ind is not None and not df_ind.empty:
+                            # 找到目标股票所在行业
+                            formatted = self._format_stock_code_for_baostock(stock_code)
+                            # 兼容无前缀匹配
+                            row_self = df_ind[(df_ind['code'] == formatted) | (df_ind['code'].str.endswith(str(stock_code)))]
+                            if not row_self.empty:
+                                bs_ind_name = row_self.iloc[0].get('industry') or ''
+                                industry_data['baostock_industry_name'] = str(bs_ind_name)
+                                peers_df = df_ind[df_ind['industry'] == bs_ind_name].copy()
+                                if not peers_df.empty:
+                                    # 构造与EM类似的成份表结构
+                                    cons = pd.DataFrame({
+                                        '代码': peers_df['code'].astype(str).str[-6:],
+                                        '名称': peers_df['code_name'] if 'code_name' in peers_df.columns else peers_df.get('codeName', '')
+                                    })
+                                    # 设置行业名称（若原本为空）
+                                    if not industry_data.get('industry_name'):
+                                        industry_data['industry_name'] = str(bs_ind_name)
+                                        industry_data['industry_name_primary'] = industry_data.get('industry_name_primary','')
+                                    if not industry_data.get('industry_source'):
+                                        industry_data['industry_source'] = 'BaoStock'
+                                    self.logger.info("✓ 使用BaoStock行业分类构造行业成份")
+                    except Exception as e_bs:
+                        self.logger.info(f"ℹ️ BaoStock行业分类兜底失败: {e_bs}")
+                    # 统一列名
+                    code_col = '代码' if '代码' in cons.columns else cons.columns[0]
+                    name_col = '名称' if '名称' in cons.columns else (cons.columns[1] if len(cons.columns)>1 else code_col)
+                    # 取快照用于涨跌幅与市值（在线失败则回退缓存）
+                    try:
+                        spot = ak.stock_zh_a_spot_em()
+                        if spot is not None and not spot.empty:
+                            self._save_spot_snapshot_cache(spot)
+                    except Exception:
+                        spot = self._load_spot_snapshot_cache()
+                    if spot is not None and not spot.empty:
+                        spot = spot[[c for c in spot.columns if c in ['代码','名称','涨跌幅','最新价','总市值','总市值(亿)']]]
+                        df = cons.merge(spot, left_on=code_col, right_on='代码', how='left')
+                    else:
+                        df = cons.copy()
+                    # 合并后，统一选择可用的代码/名称列（避免 _x/_y 冲突）
+                    def pick_col(df_cols, candidates):
+                        for c in candidates:
+                            if c in df_cols:
+                                return c
+                        return None
+                    code_candidates = [code_col, '代码', f'{code_col}_x', '代码_x', f'{code_col}_y', '代码_y']
+                    name_candidates = [name_col, '名称', f'{name_col}_x', '名称_x', f'{name_col}_y', '名称_y']
+                    code_eff = pick_col(df.columns, code_candidates) or code_col
+                    name_eff = pick_col(df.columns, name_candidates) or name_col
+                    # 计算排名
+                    def to_float(x):
+                        try:
+                            if isinstance(x,str) and x.endswith('%'):
+                                return float(x.strip('%'))
+                            return float(x)
+                        except Exception:
+                            return np.nan
+                    df['涨跌幅_val'] = df['涨跌幅'].apply(to_float) if '涨跌幅' in df.columns else np.nan
+                    cap_col = '总市值' if '总市值' in df.columns else ('总市值(亿)' if '总市值(亿)' in df.columns else None)
+                    if cap_col:
+                        df['总市值_val'] = df[cap_col].apply(to_float)
+                    else:
+                        df['总市值_val'] = np.nan
+                    # 排名与百分位
+                    df['rank_return'] = df['涨跌幅_val'].rank(ascending=False, method='min')
+                    df['pct_return'] = df['rank_return'] / df['rank_return'].max()
+                    df['rank_mktcap'] = df['总市值_val'].rank(ascending=False, method='min')
+                    df['pct_mktcap'] = df['rank_mktcap'] / df['rank_mktcap'].max()
+                    # 当前个股行（兼容不同代码列名）
+                    code_match_col = '代码' if '代码' in df.columns else code_eff
+                    try:
+                        cur = df[df[code_match_col].astype(str) == str(stock_code)]
+                    except Exception:
+                        cur = pd.DataFrame()
+                    if not cur.empty:
+                        row = cur.iloc[0]
+                        industry_data['industry_rank'] = {
+                            'peers_count': int(len(df)),
+                            'return_rank': float(row.get('rank_return', np.nan)),
+                            'return_percentile': float(row.get('pct_return', np.nan)),
+                            'mktcap_rank': float(row.get('rank_mktcap', np.nan)),
+                            'mktcap_percentile': float(row.get('pct_mktcap', np.nan)),
+                        }
+                        industry_data['in_constituents'] = True
                     else:
                         industry_data['industry_rank'] = {}
+                        industry_data['in_constituents'] = False
+                    # 附带少量同业摘要
+                    try:
+                        cols = []
+                        for c in [code_eff, name_eff]:
+                            if c and c in df.columns and c not in cols:
+                                cols.append(c)
+                        if '涨跌幅' in df.columns:
+                            cols.append('涨跌幅')
+                        if '总市值' in df.columns:
+                            cols.append('总市值')
+                        elif '总市值(亿)' in df.columns:
+                            cols.append('总市值(亿)')
+                        if cols:
+                            peers = df[cols].head(20).to_dict('records')
+                        else:
+                            peers = cons.head(20).to_dict('records')
+                    except Exception:
+                        peers = []
                 else:
                     industry_data['industry_rank'] = {}
-                    self.logger.info("ℹ️ 行业排名数据暂时不可用")
+                    industry_data['in_constituents'] = False
             except Exception as e:
-                self.logger.warning(f"获取行业排名失败: {e}")
+                self.logger.warning(f"同业对比失败: {e}")
                 industry_data['industry_rank'] = {}
-            
+                industry_data['in_constituents'] = False
+            industry_data['peers_sample'] = peers
+
+            # 汇总行业标签
+            try:
+                tags = []
+                for t in [industry_data.get('industry_name_primary',''), industry_data.get('baostock_industry_name','')]:
+                    if isinstance(t, str) and t.strip() and t not in tags:
+                        tags.append(t)
+                industry_data['industry_tags'] = tags
+            except Exception:
+                pass
+
             return industry_data
-            
         except Exception as e:
             self.logger.warning(f"行业分析失败: {e}")
             return {}
@@ -1190,11 +1973,12 @@ class EnhancedStockAnalyzer:
                     processed_news = []
                     for _, row in company_news.head(50).iterrows():
                         news_item = {
-                            'title': str(row.get(row.index[0], '')),  # 第一列通常是标题
-                            'content': str(row.get(row.index[1], '')) if len(row.index) > 1 else '',
-                            'date': str(row.get(row.index[2], '')) if len(row.index) > 2 else datetime.now().strftime('%Y-%m-%d'),
-                            'source': 'eastmoney',
-                            'url': str(row.get(row.index[3], '')) if len(row.index) > 3 else '',
+                            'title': str(row.get('新闻标题', '')),
+                            'content': str(row.get('新闻内容', '')),
+                            'date': str(row.get('发布时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))),
+                            'source': str(row.get('文章来源', 'eastmoney')),
+                            'url': str(row.get('新闻链接', '')),
+                            'keyword': str(row.get('关键词', stock_code)),
                             'relevance_score': 1.0
                         }
                         processed_news.append(news_item)
@@ -1209,21 +1993,38 @@ class EnhancedStockAnalyzer:
             # 2. 公司公告
             try:
                 self.logger.info("正在获取公司公告...")
-                announcements = ak.stock_zh_a_alerts_cls(symbol=stock_code)
+                announcements = ak.stock_notice_report()
                 if not announcements.empty:
+                    # 筛选当前股票的公告（兼容不同列名）
+                    code_cols = [c for c in ['代码','股票代码','证券代码','证券代码(6位)'] if c in announcements.columns]
+                    if not code_cols:
+                        # 找一个看起来像代码的列
+                        code_cols = [c for c in announcements.columns if '代码' in str(c)] or [announcements.columns[0]]
+                    code_col = code_cols[0]
+                    stock_announcements = announcements[announcements[code_col].astype(str) == str(stock_code)]
+                    # 仅保留最近365天（兼容不同日期列名）
+                    date_cols = [c for c in ['公告日期','公告时间','日期','发布时间'] if c in stock_announcements.columns]
+                    if date_cols:
+                        try:
+                            cutoff = (datetime.now() - timedelta(days=365)).date()
+                            dt = pd.to_datetime(stock_announcements[date_cols[0]], errors='coerce').dt.date
+                            stock_announcements = stock_announcements.loc[dt >= cutoff]
+                        except Exception:
+                            pass
                     processed_announcements = []
-                    for _, row in announcements.head(30).iterrows():
+                    for _, row in stock_announcements.head(30).iterrows():
                         announcement = {
-                            'title': str(row.get(row.index[0], '')),
-                            'content': str(row.get(row.index[1], '')) if len(row.index) > 1 else '',
-                            'date': str(row.get(row.index[2], '')) if len(row.index) > 2 else datetime.now().strftime('%Y-%m-%d'),
-                            'type': str(row.get(row.index[3], '')) if len(row.index) > 3 else '公告',
+                            'title': str(row.get('公告标题', '')),
+                            'content': str(row.get('公告类型', '')) + ' - ' + str(row.get('公告标题', '')),
+                            'date': str(row.get('公告日期') or row.get('公告时间') or row.get('日期') or row.get('发布时间') or datetime.now().strftime('%Y-%m-%d')),
+                            'type': str(row.get('公告类型', '公告')),
                             'relevance_score': 1.0
                         }
                         processed_announcements.append(announcement)
-                    
                     all_news_data['announcements'] = processed_announcements
                     self.logger.info(f"✓ 获取公司公告 {len(processed_announcements)} 条")
+                else:
+                    self.logger.info("未获取到公司公告数据")
             except Exception as e:
                 self.logger.warning(f"获取公司公告失败: {e}")
             
@@ -1420,8 +2221,19 @@ class EnhancedStockAnalyzer:
 
             # 置信度：数据量与时间新鲜度合成
             n = len(dedup_items)
-            recency = float(np.mean([it.get('time_weight', 0.0) for it in dedup_items])) if n else 0.0
-            confidence = float(min(1.0, (n / 60.0) * 0.6 + recency * 0.4))
+            try:
+                # 基于数量的置信度上限曲线（100条以上基本饱和）
+                qty_conf = float(min(1.0, np.log1p(n) / np.log1p(100)))
+            except Exception:
+                qty_conf = float(min(1.0, n / 100.0))
+
+            # 基于时间的平均权重（越新越高）
+            try:
+                avg_time_w = float(np.mean([it.get('time_weight', 1.0) for it in dedup_items])) if n else 0.0
+            except Exception:
+                avg_time_w = 0.0
+
+            confidence = float(max(0.0, min(1.0, 0.3 + 0.5 * qty_conf + 0.2 * avg_time_w)))
 
             result = {
                 'overall_sentiment': overall,
@@ -1524,6 +2336,21 @@ class EnhancedStockAnalyzer:
 
                 technical_analysis['price_above_ma20'] = latest / ma20 if ma20 else 1.0
                 technical_analysis['ma_slope20'] = float(price_data['ma20'].diff().iloc[-1]) if len(price_data) >= 2 else 0.0
+                # 关键均线指标输出
+                technical_analysis['ma20'] = ma20
+                technical_analysis['ma50'] = ma50
+                try:
+                    technical_analysis['price_vs_ma20_pct'] = float((latest - ma20) / ma20 * 100.0) if ma20 else 0.0
+                except Exception:
+                    technical_analysis['price_vs_ma20_pct'] = 0.0
+                try:
+                    technical_analysis['price_vs_ma50_pct'] = float((latest - ma50) / ma50 * 100.0) if ma50 else 0.0
+                except Exception:
+                    technical_analysis['price_vs_ma50_pct'] = 0.0
+                try:
+                    technical_analysis['ma_slope50'] = float(price_data['ma50'].diff().iloc[-1]) if len(price_data) >= 2 else 0.0
+                except Exception:
+                    technical_analysis['ma_slope50'] = 0.0
                 ma20_series = price_data['ma20']
                 close_series = close
             except Exception:
@@ -2026,7 +2853,12 @@ class EnhancedStockAnalyzer:
             # 确保使用收盘价作为当前价格
             current_price = float(latest['close'])
             self.logger.info(f"✓ 当前价格(收盘价): {current_price}")
-            
+            # 缓存最近价格
+            try:
+                self._last_price = float(current_price)
+            except Exception:
+                self._last_price = None
+
             # 如果收盘价异常，尝试使用其他价格
             if pd.isna(current_price) or current_price <= 0:
                 if 'open' in price_data.columns and not pd.isna(latest['open']) and latest['open'] > 0:
@@ -2134,6 +2966,747 @@ class EnhancedStockAnalyzer:
             self.logger.warning(f"生成投资建议失败: {e}")
             return "数据不足，建议谨慎"
 
+    def _get_stock_snapshot_with_retry(self, max_retries: int = 3) -> pd.DataFrame:
+        """获取A股快照数据，带重试机制"""
+        try:
+            import akshare as ak
+        except Exception:
+            self.logger.warning("⚠️ akshare 未安装，无法获取在线快照")
+            return pd.DataFrame()
+        
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"📊 正在获取A股实时快照（尝试 {attempt + 1}/{max_retries}）...")
+                spot = ak.stock_zh_a_spot_em()
+                if spot is not None and not spot.empty:
+                    self.logger.info(f"✅ 成功获取A股快照，共 {len(spot)} 只股票")
+                    try:
+                        self._save_spot_snapshot_cache(spot)
+                    except Exception as e:
+                        self.logger.debug(f"缓存保存失败: {e}")
+                    return spot
+            except Exception as e:
+                self.logger.warning(f"⚠️ 第 {attempt + 1} 次尝试失败: {str(e)[:100]}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(1 * (attempt + 1))  # 递增等待时间
+        
+        self.logger.warning("⚠️ 在线快照获取失败，尝试使用本地缓存")
+        return pd.DataFrame()
+
+    def get_quick_recommendations(self, top_n: int = 20, min_mktcap_e: float = 30.0, exclude_st: bool = True) -> List[Dict]:
+        """基于快照的轻量级推荐列表（不拉取逐股深度数据，秒级返回）。
+
+        返回每项示例：
+        {
+          'stock_code': '000001', 'stock_name': '平安银行',
+          'latest_price': 12.34, 'change_pct': 1.23,
+          'pe': 8.9, 'mktcap_e': 1500.0,  # 亿
+          'score': 87.5, 'recommendation': '建议买入'
+        }
+        """
+        # 获取快照数据（带重试）
+        spot = self._get_stock_snapshot_with_retry(max_retries=3)
+        
+        # 如果在线失败，尝试本地缓存
+        if (spot is None) or spot.empty:
+            self.logger.info("📂 尝试从本地缓存加载快照数据...")
+            spot = self._load_spot_snapshot_cache()
+            if spot is not None and not spot.empty:
+                self.logger.info(f"✅ 成功从缓存加载 {len(spot)} 只股票数据")
+        
+        # 如果仍然失败，使用离线兜底
+        if spot is None or spot.empty:
+            # 离线兜底：使用BaoStock历史K线做快速候选（无PE/市值过滤）
+            self.logger.warning("无法获取A股快照，进入离线兜底模式(基于BaoStock价格数据)")
+            try:
+                fallback_rows = self._quick_recommendations_offline_via_price(top_n=max(5, int(top_n)), exclude_st=exclude_st)
+                if fallback_rows:
+                    self.logger.info(f"✓ 离线兜底生成 {len(fallback_rows)} 条推荐（基于近端动量/波动）")
+                    return fallback_rows
+            except Exception as e:
+                self.logger.warning(f"离线兜底失败: {e}")
+            return []
+
+        df = spot.copy()
+
+        # 列名选择器
+        def pick_col(cands: List[str]) -> Optional[str]:
+            for c in cands:
+                if c in df.columns:
+                    return c
+            return None
+
+        code_col = pick_col(['代码','股票代码','证券代码','A股代码','code']) or df.columns[0]
+        name_col = pick_col(['名称','股票简称','简称','name']) or (df.columns[1] if len(df.columns) > 1 else code_col)
+        pct_col  = pick_col(['涨跌幅','涨跌幅(%)','涨跌幅%','pct_chg'])
+        price_col= pick_col(['最新价','现价','价格','最新'])
+        pe_col   = pick_col(['市盈率-动态','市盈率TTM','市盈率'])
+        mcap_col = pick_col(['总市值(亿)','总市值'])
+
+        def to_float(x) -> Optional[float]:
+            try:
+                if isinstance(x, str):
+                    xs = x.strip().replace(',', '')
+                    if xs.endswith('%'):
+                        return float(xs.rstrip('%'))
+                    return float(xs)
+                return float(x)
+            except Exception:
+                return None
+
+        # 预处理并过滤
+        out_rows = []
+        for _, r in df.iterrows():
+            try:
+                code = str(r.get(code_col, '')).strip() if code_col else ''
+                if not code or len(code) < 6:
+                    continue
+                code = code[-6:]  # 统一6位
+                name = str(r.get(name_col, code)) if name_col else code
+                if exclude_st and any(x in str(name) for x in ['ST','*ST','退']):
+                    continue
+
+                # 市值（亿）
+                mktcap_e = to_float(r.get(mcap_col)) if mcap_col else None
+                # 若列为“总市值”且量级较大，尝试按元 -> 亿转换
+                if mktcap_e is not None and mcap_col == '总市值' and mktcap_e > 1e9:
+                    mktcap_e = mktcap_e / 1e8
+                if (mktcap_e is None) or (mktcap_e < min_mktcap_e):
+                    continue
+
+                # PE
+                pe = to_float(r.get(pe_col)) if pe_col else None
+                if pe is None or pe <= 0 or pe > 1200:  # 排除异常值
+                    continue
+
+                # 涨跌幅（%）
+                chg = to_float(r.get(pct_col)) if pct_col else None
+                if chg is None:
+                    chg = 0.0
+
+                # 价格
+                price = to_float(r.get(price_col)) if price_col else None
+                if price is None or price <= 0:
+                    price = 0.0
+
+                # 评分构造：动量(当日涨跌) + 估值(低PE) + 体量（适中市值）
+                # 动量：-5%~+5%线性映射到[0,1]
+                mom = max(0.0, min(1.0, (float(chg) + 5.0) / 10.0))
+                # 估值：0~80 映射，越低越好
+                pe_eff = max(0.0, min(120.0, float(pe)))
+                pe_score = max(0.0, min(1.0, (80.0 - pe_eff) / 80.0))
+                # 市值：偏好 80~300 亿
+                x = float(mktcap_e)
+                if x <= 30:
+                    mcap_score = 0.2
+                elif x <= 80:
+                    mcap_score = 0.6 + (x - 80.0) / 50.0 * 0.4  # 向80靠拢
+                elif x <= 300:
+                    mcap_score = 1.0 - abs((x - 190.0) / 110.0) * 0.4  # 190附近最佳
+                elif x <= 800:
+                    mcap_score = 0.8 - (x - 300.0) / 500.0 * 0.6
+                else:
+                    mcap_score = 0.2
+                mcap_score = max(0.0, min(1.0, mcap_score))
+
+                score01 = 0.45 * mom + 0.35 * pe_score + 0.20 * mcap_score
+                score = float(round(score01 * 100.0, 2))
+
+                # 快速建议（占位：用构造分数映射）
+                quick_scores = {
+                    'technical': mom * 100.0,
+                    'fundamental': pe_score * 100.0,
+                    'sentiment': 50.0,
+                }
+                quick_scores['comprehensive'] = self.calculate_comprehensive_score(quick_scores)
+                rec = self.generate_recommendation(quick_scores)
+
+                out_rows.append({
+                    'stock_code': code,
+                    'stock_name': name,
+                    'latest_price': float(price),
+                    'change_pct': float(chg),
+                    'pe': float(pe),
+                    'mktcap_e': float(mktcap_e),
+                    'score': score,
+                    'recommendation': rec
+                })
+            except Exception:
+                continue
+
+        if not out_rows:
+            return []
+        # 排序并截断
+        out_rows.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+        return out_rows[: max(1, int(top_n))]
+
+    def _get_candidate_codes_via_baostock(self, exclude_st: bool = True, limit: int = 200) -> List[Dict]:
+        """通过BaoStock获取A股候选代码列表（含名称），用于离线兜底。
+
+        返回: [{ 'code': '000001', 'name': '平安银行' }, ...]
+        """
+        try:
+            if not getattr(self, 'baostock_connected', False):
+                return []
+            # 行业接口通常包含较全成份
+            df_ind = self._query_baostock_data(bs.query_stock_industry)
+            if df_ind is None or df_ind.empty:
+                # 退而求其次：全市场列表（可能无名称）
+                rs = bs.query_all_stock()
+                rows = []
+                while (rs.error_code == '0') and rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    return []
+                import pandas as pd
+                df = pd.DataFrame(rows, columns=rs.fields)
+                codes = []
+                for _, r in df.iterrows():
+                    code = str(r.get('code',''))
+                    if '.' in code:
+                        code = code.split('.')[-1]
+                    code = code[-6:]
+                    if len(code) == 6 and code.isdigit():
+                        codes.append({'code': code, 'name': ''})
+                return codes[:max(1, int(limit))]
+
+            # 规范化
+            codes = []
+            for _, r in df_ind.iterrows():
+                try:
+                    code = str(r.get('code',''))
+                    name = str(r.get('code_name',''))
+                    if '.' in code:
+                        code = code.split('.')[-1]
+                    code = code[-6:]
+                    if len(code) != 6 or (not code.isdigit()):
+                        continue
+                    if exclude_st and any(x in name for x in ['ST','*ST','退']):
+                        continue
+                    codes.append({'code': code, 'name': name})
+                except Exception:
+                    continue
+            # 去重保序
+            seen = set()
+            uniq = []
+            for it in codes:
+                if it['code'] in seen:
+                    continue
+                seen.add(it['code'])
+                uniq.append(it)
+            return uniq[:max(1, int(limit))]
+        except Exception:
+            return []
+
+    def _quick_recommendations_offline_via_price(self, top_n: int = 20, exclude_st: bool = True) -> List[Dict]:
+        """当快照与缓存都不可用时的兜底：
+        用BaoStock可用的历史K线，计算近20日动量/波动的简单分数，输出TopN。
+
+        注意：PE/总市值无法保证，置为0。该模式主要为“有结果不空白”。
+        """
+        try:
+            import numpy as np
+            import pandas as pd
+        except Exception:
+            return []
+
+        cands = self._get_candidate_codes_via_baostock(exclude_st=exclude_st, limit=max(120, int(top_n) * 20))
+        if not cands:
+            return []
+
+        out = []
+        scanned = 0
+        for it in cands:
+            if len(out) >= max(10, int(top_n) * 2):  # 收集一定冗余后停止
+                break
+            code = it['code']
+            name = it.get('name') or code
+            try:
+                df = self.get_stock_data(code)
+                if df is None or df.empty or 'close' not in df.columns:
+                    continue
+                close = pd.to_numeric(df['close'], errors='coerce').dropna()
+                if len(close) < 22:
+                    continue
+                close = close.tail(25)
+                last = float(close.iloc[-1])
+                prev = float(close.iloc[-2]) if len(close) >= 2 else last
+                daily_chg_pct = ((last - prev) / prev) * 100.0 if prev > 1e-8 else 0.0
+                # 近20日动量
+                base = float(close.iloc[-21]) if len(close) >= 21 else last
+                momentum = (last - base) / base if base > 1e-8 else 0.0
+                # 简易波动（近20日对数收益的标准差）
+                rets = np.diff(np.log(close.values))
+                vol = float(np.std(rets[-20:])) if len(rets) >= 20 else float(np.std(rets))
+
+                # 评分：动量越高越好，波动越低越好
+                mom_score = max(0.0, min(1.0, (momentum + 0.20) / 0.40))  # 约 -20%~+20% 映射到 0~1
+                vol_score = 1.0 - max(0.0, min(1.0, vol / 0.06))          # 年化约化简，粗略阈值
+                score = float(round(100.0 * (0.75 * mom_score + 0.25 * vol_score), 2))
+
+                quick_scores = {
+                    'technical': mom_score * 100.0,
+                    'fundamental': 50.0,
+                    'sentiment': 50.0,
+                }
+                quick_scores['comprehensive'] = self.calculate_comprehensive_score(quick_scores)
+                rec = self.generate_recommendation(quick_scores)
+
+                out.append({
+                    'stock_code': code,
+                    'stock_name': name,
+                    'latest_price': float(round(last, 3)),
+                    'change_pct': float(round(daily_chg_pct, 3)),
+                    'pe': 0.0,
+                    'mktcap_e': 0.0,
+                    'score': score,
+                    'recommendation': rec
+                })
+            except Exception:
+                continue
+            finally:
+                scanned += 1
+
+        if not out:
+            return []
+        out.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+        return out[: max(1, int(top_n))]
+
+    # ===== 规则筛选推荐（7日窗口）=====
+    def _fetch_recent_ohlcv_light(self, stock_code: str, window_days: int = 25) -> pd.DataFrame:
+        """轻量获取近端日K数据，用于规则筛选。优先akshare，失败回退缓存与通用接口。
+
+        参数：
+            window_days: 需要的交易日数量（不是自然日），默认25个交易日
+        
+        返回：DataFrame包含列：open, high, low, close, volume，索引为日期升序。
+        
+        注意：返回的数据为交易日数据，已自动排除周末和节假日。
+        """
+        try:
+            import akshare as ak
+            end_date = datetime.now().strftime('%Y%m%d')
+            start_date = (datetime.now() - timedelta(days=max(30, int(window_days) * 3))).strftime('%Y%m%d')
+            df = ak.stock_zh_a_hist(
+                symbol=str(stock_code),
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq"
+            )
+            if df is None or df.empty:
+                raise RuntimeError("akshare返回空")
+            # 标准化列
+            mapping = {
+                '日期': 'date', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'
+            }
+            for c_cn, c_en in mapping.items():
+                if c_cn in df.columns:
+                    df[c_en] = df[c_cn]
+            # 成交量单位转股：ak是手
+            if 'volume' in df.columns:
+                try:
+                    df['volume'] = pd.to_numeric(df['volume'], errors='coerce') * 100.0
+                except Exception:
+                    pass
+            # 索引与数值化
+            try:
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df = df.set_index('date')
+                else:
+                    df.index = pd.to_datetime(df.index)
+            except Exception:
+                pass
+            for c in ['open','high','low','close','volume']:
+                if c in df.columns:
+                    try:
+                        df[c] = pd.to_numeric(df[c], errors='coerce')
+                    except Exception:
+                        pass
+            df = df[['open','high','low','close','volume']].dropna()
+            df = df.sort_index()
+            # 返回最近的N个交易日数据（+5是为了确保有足够的数据进行分析）
+            # 注意：akshare返回的日K数据已经是交易日，自动排除了周末和节假日
+            result_df = df.tail(int(window_days) + 5)
+            self.logger.debug(f"获取到 {len(result_df)} 个交易日的K线数据，用于分析")
+            return result_df
+        except Exception:
+            # 回退：使用通用缓存的get_stock_data
+            try:
+                base = self.get_stock_data(stock_code)
+                if base is None or base.empty:
+                    return pd.DataFrame()
+                cols = [c for c in ['open','high','low','close','volume'] if c in base.columns]
+                if not cols:
+                    return pd.DataFrame()
+                df = base[cols].copy()
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    try:
+                        df.index = pd.to_datetime(base.get('date', base.index))
+                    except Exception:
+                        pass
+                df = df.sort_index().tail(int(window_days) + 5)
+                return df
+            except Exception:
+                return pd.DataFrame()
+
+    def _check_7day_rule(self, df: pd.DataFrame) -> Tuple[bool, float, dict]:
+        """在给定的近端OHLCV数据上检查7日规则，返回(是否满足, 规则得分0-100, 诊断信息)。
+
+        规则口径（结合用户描述，做合理工程化近似）：
+        - 取最近7个交易日作为窗口d1..d7（d7为最近日）。
+        - 第2日为阴线且第3日为阳线（阴→阳），视作“第3日走阴阳线”的组合信号。
+        - 第4日最高价 > 第3日最高价（突破确认，允许最小0.3%容差）。
+        - 成交量整体呈“前低后高或波动放大”：
+          a) 后三日(5-7)总量 > 前三日(1-3)总量；或
+          b) 成交量对时间的回归斜率>0；或
+          c) 成交量的变异系数(std/mean) >= 0.28。
+        - 附加细则（加分项）：
+          • 窗口内最大量当日的涨跌为正；
+          • 最小量出现在下跌日；
+          • 窗口内有1-2日实体较小(十字/横盘)，但伴随放量。
+        """
+        diag = {}
+        try:
+            if df is None or df.empty or len(df) < 7:
+                return False, 0.0, {'reason': '数据不足'}
+            
+            # 确保索引为日期类型，并排序
+            if not isinstance(df.index, pd.DatetimeIndex):
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    return False, 0.0, {'reason': '日期索引转换失败'}
+            
+            # 排序并取最近7个交易日（K线数据本身就是交易日，无需额外过滤）
+            df_sorted = df.sort_index(ascending=True)
+            
+            # 取最近7个交易日（注意：K线数据本身已是交易日，自动排除了周末和节假日）
+            w = df_sorted.tail(7).copy()
+            
+            # 数据有效性验证：确保有7个不同的交易日
+            if len(w) < 7:
+                return False, 0.0, {'reason': f'交易日数量不足，仅有{len(w)}个交易日'}
+            
+            # 记录用于分析的交易日期范围（便于调试）
+            try:
+                date_range = f"{w.index[0].strftime('%Y-%m-%d')} 至 {w.index[-1].strftime('%Y-%m-%d')}"
+                diag['trading_date_range'] = date_range
+                diag['trading_days_count'] = len(w)
+            except Exception:
+                pass
+            
+            w = w[['open','high','low','close','volume']].astype(float)
+            w.index = pd.to_datetime(w.index)
+            o = w['open'].values
+            h = w['high'].values
+            l = w['low'].values
+            c = w['close'].values
+            v = w['volume'].values
+
+            # 阴→阳（d2阴, d3阳）
+            cond_yinyang = (c[1] < o[1]) and (c[2] > o[2])
+            # d4 突破 d3 high，允许0.3%容差
+            cond_break = h[3] > (h[2] * 1.003)
+
+            # 量能趋势：后三日量 > 前三日量 或 斜率>0 或 变异系数高
+            front = float(v[0] + v[1] + v[2])
+            back = float(v[4] + v[5] + v[6])
+            cond_back_higher = back > front * 1.05
+            # 简单回归斜率
+            try:
+                x = np.arange(len(v))
+                slope = np.polyfit(x, v, 1)[0]
+            except Exception:
+                slope = 0.0
+            cond_slope_pos = slope > 0
+            # 变异系数
+            vmean = float(np.mean(v)) if np.isfinite(np.mean(v)) else 0.0
+            vstdev = float(np.std(v)) if np.isfinite(np.std(v)) else 0.0
+            cond_cv = (vmean > 0) and ((vstdev / vmean) >= 0.28)
+
+            volume_trend = cond_back_higher or cond_slope_pos or cond_cv
+
+            base_ok = cond_yinyang and cond_break and volume_trend
+
+            # 加分项
+            bonus = 0.0
+            # 最大/最小量日位置与涨跌
+            try:
+                max_idx = int(np.argmax(v))
+                min_idx = int(np.argmin(v))
+            except Exception:
+                max_idx = 0
+                min_idx = 0
+            ret = np.diff(c, prepend=c[0]) / np.maximum(1e-6, np.concatenate([[c[0]], c[:-1]]))
+            if max_idx >= 0 and max_idx < len(ret) and ret[max_idx] > 0:
+                bonus += 8.0
+            if min_idx >= 0 and min_idx < len(ret) and ret[min_idx] < 0:
+                bonus += 4.0
+
+            # 小实体放量（日内振幅占收盘价的比例 < 1.2%，但相对量能>窗口均值）
+            body = np.abs(c - o)
+            body_ratio = body / np.maximum(1e-6, c)
+            amp = (h - l) / np.maximum(1e-6, c)
+            for i in range(len(w)):
+                if body_ratio[i] <= 0.012 and v[i] >= vmean * 1.15 and amp[i] <= 0.035:
+                    bonus += 3.0
+                    break
+
+            # 规则评分：
+            score = 0.0
+            if cond_yinyang:
+                score += 35.0
+            if cond_break:
+                score += 30.0
+            if volume_trend:
+                score += 20.0
+            score += bonus
+            score = float(max(0.0, min(100.0, score)))
+
+            diag.update({
+                'yinyang': bool(cond_yinyang),
+                'break_high': bool(cond_break),
+                'volume_trend': bool(volume_trend),
+                'bonus': float(bonus)
+            })
+            return bool(base_ok), score, diag
+        except Exception as e:
+            return False, 0.0, {'error': str(e)}
+
+    def get_rule_based_recommendations(self, top_n: int = 20, min_mktcap_e: float = 30.0, exclude_st: bool = True) -> List[Dict]:
+        """按7日价格/量能规则筛选推荐列表。
+
+        流程：
+        1) 取A股快照做“候选池”（过滤ST、退市、总市值下限）。
+        2) 对候选逐股拉取近端日K（约25天），检测7日规则。
+        3) 对满足规则的，结合快照动量/估值做综合排序，返回TopN。
+        """
+        try:
+            import akshare as ak
+        except Exception:
+            ak = None
+
+        # 候选池（与快照推荐一致）
+        spot = pd.DataFrame()
+        if ak is not None:
+            try:
+                spot = ak.stock_zh_a_spot_em()
+                if spot is not None and not spot.empty:
+                    try:
+                        self._save_spot_snapshot_cache(spot)
+                    except Exception:
+                        pass
+            except Exception:
+                spot = pd.DataFrame()
+        if (spot is None) or spot.empty:
+            spot = self._load_spot_snapshot_cache()
+        if spot is None or spot.empty:
+            # 离线兜底：直接用BaoStock构造候选池（仅代码/名称），后续逐股拉K做规则判定
+            self.logger.warning("无法获取A股快照，规则推荐改用BaoStock候选池")
+            df = None
+            candidates = []
+            try:
+                pool = self._get_candidate_codes_via_baostock(exclude_st=exclude_st, limit=max(200, int(top_n) * 40))
+                for it in pool:
+                    candidates.append({
+                        'stock_code': it['code'],
+                        'stock_name': it.get('name') or it['code'],
+                        'mktcap_e': 0.0,
+                        'change_pct': 0.0,
+                        'latest_price': 0.0,
+                        'pe': 60.0  # 合理默认用于排序
+                    })
+            except Exception:
+                pass
+            if not candidates:
+                return []
+
+            # 直接进入扫描阶段
+            passed = []
+            scan_cap = min(len(candidates), max(200, int(top_n) * 40))
+            pool = candidates[:scan_cap]
+            for item in pool:
+                code = item['stock_code']
+                df_k = self._fetch_recent_ohlcv_light(code, window_days=25)
+                if df_k is None or df_k.empty or len(df_k) < 7:
+                    continue
+                ok, rule_score, diag = self._check_7day_rule(df_k)
+                if not ok:
+                    continue
+                # 快速分（无PE/市值，使用默认）
+                chg = float(item.get('change_pct', 0.0))
+                mom = max(0.0, min(1.0, (chg + 5.0) / 10.0))
+                pe_eff = max(0.0, min(120.0, float(item.get('pe', 60.0))))
+                pe_score = max(0.0, min(1.0, (80.0 - pe_eff) / 80.0))
+                x = float(item.get('mktcap_e', 100.0))
+                if x <= 30:
+                    mcap_score = 0.2
+                elif x <= 80:
+                    mcap_score = 0.6 + (x - 80.0) / 50.0 * 0.4
+                elif x <= 300:
+                    mcap_score = 1.0 - abs((x - 190.0) / 110.0) * 0.4
+                elif x <= 800:
+                    mcap_score = 0.8 - (x - 300.0) / 500.0 * 0.6
+                else:
+                    mcap_score = 0.2
+                mcap_score = max(0.0, min(1.0, mcap_score))
+                quick01 = 0.45 * mom + 0.35 * pe_score + 0.20 * mcap_score
+                quick_score = float(round(quick01 * 100.0, 2))
+
+                combo_score = float(round(0.7 * rule_score + 0.3 * quick_score, 2))
+                quick_scores = {
+                    'technical': float(rule_score),
+                    'fundamental': pe_score * 100.0,
+                    'sentiment': 55.0,
+                }
+                quick_scores['comprehensive'] = self.calculate_comprehensive_score(quick_scores)
+                rec = self.generate_recommendation(quick_scores)
+
+                passed.append({
+                    'stock_code': item['stock_code'],
+                    'stock_name': item['stock_name'],
+                    'latest_price': float(item.get('latest_price', 0.0)),
+                    'change_pct': float(item.get('change_pct', 0.0)),
+                    'pe': float(item.get('pe', 60.0)),
+                    'mktcap_e': float(item.get('mktcap_e', 0.0)),
+                    'score': combo_score,
+                    'recommendation': rec
+                })
+
+            if not passed:
+                return []
+            passed.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+            return passed[: max(1, int(top_n))]
+
+        df = spot.copy()
+
+        def pick_col(cands: List[str]) -> Optional[str]:
+            for c in cands:
+                if c in df.columns:
+                    return c
+            return None
+
+        code_col = pick_col(['代码','股票代码','证券代码','A股代码','code']) or df.columns[0]
+        name_col = pick_col(['名称','股票简称','简称','name']) or (df.columns[1] if len(df.columns) > 1 else code_col)
+        pct_col  = pick_col(['涨跌幅','涨跌幅(%)','涨跌幅%','pct_chg'])
+        price_col= pick_col(['最新价','现价','价格','最新'])
+        pe_col   = pick_col(['市盈率-动态','市盈率TTM','市盈率'])
+        mcap_col = pick_col(['总市值(亿)','总市值'])
+
+        def to_float(x) -> Optional[float]:
+            try:
+                if isinstance(x, str):
+                    xs = x.strip().replace(',', '')
+                    if xs.endswith('%'):
+                        return float(xs.rstrip('%'))
+                    return float(xs)
+                return float(x)
+            except Exception:
+                return None
+
+        # 预筛 + 控制规模
+        candidates = []
+        for _, r in df.iterrows():
+            try:
+                code = str(r.get(code_col, '')).strip()
+                if not code:
+                    continue
+                code = code[-6:]
+                # 过滤异常代码（必须为6位数字）
+                if len(code) != 6 or (not code.isdigit()):
+                    continue
+                name = str(r.get(name_col, code))
+                if exclude_st and any(x in str(name) for x in ['ST','*ST','退']):
+                    continue
+                mktcap_e = to_float(r.get(mcap_col)) if mcap_col else None
+                if mktcap_e is not None and mcap_col == '总市值' and mktcap_e > 1e9:
+                    mktcap_e = mktcap_e / 1e8
+                if (mktcap_e is None) or (mktcap_e < min_mktcap_e):
+                    continue
+                chg = to_float(r.get(pct_col)) if pct_col else 0.0
+                price = to_float(r.get(price_col)) if price_col else 0.0
+                pe = to_float(r.get(pe_col)) if pe_col else None
+                if pe is None or pe <= 0 or pe > 1200:
+                    continue
+                candidates.append({
+                    'stock_code': code,
+                    'stock_name': name,
+                    'mktcap_e': float(mktcap_e),
+                    'change_pct': float(chg) if chg is not None else 0.0,
+                    'latest_price': float(price) if price is not None else 0.0,
+                    'pe': float(pe)
+                })
+            except Exception:
+                continue
+
+        if not candidates:
+            return []
+
+        # 限制扫描规模：优先动量+中等体量（简单排序后取前K）
+        candidates.sort(key=lambda x: (abs(x.get('change_pct', 0.0)) * 0.6 + (1.0 / (1.0 + abs(x.get('pe', 50.0)))) * 0.4), reverse=True)
+        scan_cap = min(len(candidates), max(200, int(top_n) * 40))  # 扫描上限
+        pool = candidates[:scan_cap]
+
+        passed = []
+        for item in pool:
+            code = item['stock_code']
+            df_k = self._fetch_recent_ohlcv_light(code, window_days=25)
+            if df_k is None or df_k.empty or len(df_k) < 7:
+                continue
+            ok, rule_score, diag = self._check_7day_rule(df_k)
+            if not ok:
+                continue
+            # 快照分（与快速推荐一致）
+            chg = float(item.get('change_pct', 0.0))
+            mom = max(0.0, min(1.0, (chg + 5.0) / 10.0))
+            pe_eff = max(0.0, min(120.0, float(item.get('pe', 60.0))))
+            pe_score = max(0.0, min(1.0, (80.0 - pe_eff) / 80.0))
+            x = float(item.get('mktcap_e', 100.0))
+            if x <= 30:
+                mcap_score = 0.2
+            elif x <= 80:
+                mcap_score = 0.6 + (x - 80.0) / 50.0 * 0.4
+            elif x <= 300:
+                mcap_score = 1.0 - abs((x - 190.0) / 110.0) * 0.4
+            elif x <= 800:
+                mcap_score = 0.8 - (x - 300.0) / 500.0 * 0.6
+            else:
+                mcap_score = 0.2
+            mcap_score = max(0.0, min(1.0, mcap_score))
+            quick01 = 0.45 * mom + 0.35 * pe_score + 0.20 * mcap_score
+            quick_score = float(round(quick01 * 100.0, 2))
+
+            # 综合排序分：规则为主
+            combo_score = float(round(0.7 * rule_score + 0.3 * quick_score, 2))
+
+            # 生成建议：将规则分视作技术分
+            quick_scores = {
+                'technical': float(rule_score),
+                'fundamental': pe_score * 100.0,
+                'sentiment': 55.0,
+            }
+            quick_scores['comprehensive'] = self.calculate_comprehensive_score(quick_scores)
+            rec = self.generate_recommendation(quick_scores)
+
+            passed.append({
+                'stock_code': item['stock_code'],
+                'stock_name': item['stock_name'],
+                'latest_price': float(item.get('latest_price', 0.0)),
+                'change_pct': float(item.get('change_pct', 0.0)),
+                'pe': float(item.get('pe', np.nan)),
+                'mktcap_e': float(item.get('mktcap_e', np.nan)),
+                'score': combo_score,
+                'recommendation': rec
+            })
+
+        if not passed:
+            return []
+        passed.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+        return passed[: max(1, int(top_n))]
+
     def _build_enhanced_ai_analysis_prompt(self, stock_code, stock_name, scores, technical_analysis, 
                                         fundamental_data, sentiment_analysis, price_info):
         """构建增强版AI分析提示词，包含所有详细数据"""
@@ -2191,7 +3764,6 @@ class EnhancedStockAnalyzer:
 - 均线趋势：{technical_analysis.get('ma_trend', '未知')}
 - RSI指标：{technical_analysis.get('rsi', 50):.1f}
 - MACD信号：{technical_analysis.get('macd_signal', '未知')}
-- 布林带位置：{technical_analysis.get('bb_position', 0.5):.2f}
 - 成交量状态：{technical_analysis.get('volume_status', '未知')}
 
 {financial_text}
@@ -2211,9 +3783,29 @@ class EnhancedStockAnalyzer:
 前10大股东信息：{len(fundamental_data.get('shareholders', []))}条
 机构持股：{len(fundamental_data.get('institutional_holdings', []))}条
 
-{news_text}
+**新闻数据详情：**
+- 公司新闻：{len(company_news)}条
+- 公司公告：{len(announcements)}条  
+- 研究报告：{len(research_reports)}条
+- 总新闻数：{news_summary.get('total_news_count', 0)}条
 
-{research_text}
+**重要新闻标题（前10条）：**
+"""
+        
+        for i, news in enumerate(company_news[:5], 1):
+            prompt += f"{i}. {news.get('title', '未知标题')}\n"
+        
+        for i, announcement in enumerate(announcements[:5], 1):
+            prompt += f"{i+5}. [公告] {announcement.get('title', '未知标题')}\n"
+        
+        # 提取研究报告信息
+        if research_reports:
+            prompt += "\n**研究报告摘要：**\n"
+            for i, report in enumerate(research_reports[:5], 1):
+                prompt += f"{i}. {report.get('institution', '未知机构')}: {report.get('rating', '未知评级')} - {report.get('title', '未知标题')}\n"
+        
+        # 构建完整的提示词
+        prompt += f"""
 
 **市场情绪分析：**
 - 整体情绪得分：{sentiment_analysis.get('overall_sentiment', 0):.3f}
@@ -2659,11 +4251,36 @@ class EnhancedStockAnalyzer:
             price_info = self.get_price_info(price_data)
             technical_analysis = self.calculate_technical_indicators(price_data)
             technical_score = self.calculate_technical_score(technical_analysis)
+
+            # 提前计算近月资金流向，并对技术面评分做轻量级修正
+            try:
+                capital_flow = self.calculate_capital_flow(stock_code, price_data, None, window_days=30)
+                status = (capital_flow or {}).get('status', '')
+                # 依据主力净流状态微调技术面得分（±6内）
+                if isinstance(status, str):
+                    if '主力净流入强' in status:
+                        technical_score = float(min(100.0, technical_score + 6))
+                    elif '主力净流入中' in status:
+                        technical_score = float(min(100.0, technical_score + 3))
+                    elif '主力净流入弱' in status:
+                        technical_score = float(min(100.0, technical_score + 1))
+                    elif '主力净流出较强' in status:
+                        technical_score = float(max(0.0, technical_score - 6))
+                    elif '主力净流出' in status:
+                        technical_score = float(max(0.0, technical_score - 3))
+            except Exception as e:
+                self.logger.info(f"资金流修正跳过: {e}")
+                capital_flow = {'status': '数据不足', 'note': str(e)}
             
             # 2. 获取25项财务指标和综合基本面分析
             self.logger.info("正在进行25项财务指标分析...")
             fundamental_data = self.get_comprehensive_fundamental_data(stock_code)
             fundamental_score = self.calculate_fundamental_score(fundamental_data)
+            # 2.1 使用基本面市值信息，重新计算资金流（用于报告/AI更精准的强度分级）
+            try:
+                capital_flow = self.calculate_capital_flow(stock_code, price_data, fundamental_data, window_days=30)
+            except Exception as e:
+                self.logger.info(f"资金流复算失败: {e}")
             
             # 3. 获取综合新闻数据和高级情绪分析
             self.logger.info("正在进行综合新闻和情绪分析...")
@@ -2674,7 +4291,7 @@ class EnhancedStockAnalyzer:
             # 合并新闻数据到情绪分析结果中，方便AI分析使用
             sentiment_analysis.update(comprehensive_news_data)
             
-            # 4. 计算综合得分
+            # 4. 计算综合得分（已包含资金流对技术面的修正）
             scores = {
                 'technical': technical_score,
                 'fundamental': fundamental_score,
@@ -2688,7 +4305,7 @@ class EnhancedStockAnalyzer:
             
             # 5. 生成投资建议
             recommendation = self.generate_recommendation(scores)
-            
+
             # 6. AI增强分析（包含所有详细数据）
             ai_analysis = self.generate_ai_analysis({
                 'stock_code': stock_code,
@@ -2697,6 +4314,7 @@ class EnhancedStockAnalyzer:
                 'technical_analysis': technical_analysis,
                 'fundamental_data': fundamental_data,
                 'sentiment_analysis': sentiment_analysis,
+                'capital_flow': capital_flow,
                 'scores': scores
             }, enable_streaming)
             
@@ -2710,6 +4328,7 @@ class EnhancedStockAnalyzer:
                 'fundamental_data': fundamental_data,
                 'comprehensive_news_data': comprehensive_news_data,
                 'sentiment_analysis': sentiment_analysis,
+                'capital_flow': capital_flow,
                 'scores': scores,
                 'analysis_weights': self.analysis_weights,
                 'recommendation': recommendation,
@@ -2761,6 +4380,55 @@ class EnhancedStockAnalyzer:
         news_data = self.get_comprehensive_news_data(stock_code)
         return self.calculate_advanced_sentiment_analysis(news_data)
 
+    def _latest_dt(self, df, date_candidates: List[str]):
+        """返回数据框中候选日期列的最新日期，用于新鲜度判断"""
+        try:
+            for c in date_candidates:
+                if c in df.columns:
+                    s = pd.to_datetime(df[c], errors='coerce')
+                    if s.notna().any():
+                        return s.max()
+        except Exception:
+            pass
+        return None
+
+    def _is_data_stale(self, df, date_candidates: List[str], max_days: int, what: str) -> bool:
+        """判断数据是否过旧，超过max_days则视为过期"""
+        dt = self._latest_dt(df, date_candidates)
+        if dt is None:
+            self.logger.warning(f"{what} 未找到日期列，无法判断新鲜度")
+            return False
+        try:
+            delta = (datetime.now() - dt.to_pydatetime()).days
+        except Exception:
+            delta = 99999
+        self.logger.info(f"{what} 最新日期: {getattr(dt, 'date', lambda: dt)()} (距今 {delta} 天)")
+        if delta > max_days:
+            self.logger.warning(f"{what} 数据过旧(>{max_days}天)，忽略该接口结果")
+            return True
+        return False
+
+    def _normalize_dividend_records(self, records: List[dict]) -> List[dict]:
+        """标准化分红记录结构，确保进入模型的键一致且精简"""
+        norm: List[dict] = []
+        for x in records or []:
+            year = str(x.get('year') or x.get('dividYear') or x.get('报告年度') or x.get('报告时间') or '')
+            per = x.get('dividend_per_share') or x.get('dividCashPsBeforeTax') or x.get('每股派息(税前)') or x.get('派息比例')
+            try:
+                per = float(per)
+            except Exception:
+                per = None
+            exd = x.get('ex_dividend_date') or x.get('dividOperateDate') or x.get('除权除息日') or x.get('除权日') or ''
+            src = x.get('source') or 'unknown'
+            item = {
+                'year': year,
+                'dividend_per_share': per,
+                'ex_dividend_date': str(exd),
+                'source': src,
+            }
+            if per is not None:
+                norm.append(item)
+        return norm
 
 def main():
     """主函数"""

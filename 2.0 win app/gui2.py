@@ -1,13 +1,16 @@
 import sys
+import os
 import time
 import logging
+import math
 from io import StringIO
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                            QHBoxLayout, QLineEdit, QPushButton, QTextBrowser,
                            QLabel, QTextEdit, QMessageBox, QProgressBar, 
                            QFrame, QSizePolicy, QTabWidget, QGroupBox, 
                            QGridLayout, QCheckBox, QSlider, QSpinBox,
-                           QSplitter, QScrollArea)
+                           QSplitter, QScrollArea, QTableWidget, QTableWidgetItem,
+                           QHeaderView)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QPalette, QColor, QTextCursor, QIcon
 import markdown2
@@ -80,15 +83,18 @@ class ModernFrame(QFrame):
     """现代化的面板组件"""
     def __init__(self, parent=None, elevated=False):
         super().__init__(parent)
-        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        shadow_style = "0 4px 8px rgba(0,0,0,0.1)" if elevated else "0 2px 4px rgba(0,0,0,0.05)"
-        self.setStyleSheet(f"""
-            ModernFrame {{
+        # 使用 Qt 的阴影效果而不是 CSS（Qt 不支持 box-shadow）
+        if elevated:
+            self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        else:
+            self.setFrameStyle(QFrame.Shape.StyledPanel)
+        
+        self.setStyleSheet("""
+            ModernFrame {
                 background-color: #ffffff;
                 border-radius: 12px;
                 border: 1px solid #e3f2fd;
-                box-shadow: {shadow_style};
-            }}
+            }
         """)
 
 class ModernButton(QPushButton):
@@ -111,11 +117,9 @@ class ModernButton(QPushButton):
                 }
                 QPushButton:hover {
                     background: linear-gradient(135deg, #5a6fd8 0%, #6a4190 100%);
-                    transform: translateY(-1px);
                 }
                 QPushButton:pressed {
                     background: linear-gradient(135deg, #4e5bc6 0%, #5e377e 100%);
-                    transform: translateY(0px);
                 }
                 QPushButton:disabled {
                     background: #cccccc;
@@ -167,46 +171,113 @@ class ModernLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(44)
-        self.setStyleSheet("""
-            QLineEdit {
-                border: 2px solid #e9ecef;
-                border-radius: 8px;
-                padding: 12px 16px;
-                background-color: white;
-                font-size: 14px;
-                selection-background-color: #cce0ff;
-            }
-            QLineEdit:focus {
-                border-color: #667eea;
-                background-color: #f8f9ff;
-            }
-            QLineEdit:hover {
-                border-color: #adb5bd;
-            }
-        """)
+        self.apply_theme_style()
+    
+    def apply_theme_style(self):
+        """根据当前主题应用样式"""
+        # 检测是否为深色主题
+        palette = QApplication.instance().palette()
+        is_dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        
+        if is_dark:
+            # 深色主题样式
+            self.setStyleSheet("""
+                QLineEdit {
+                    border: 2px solid #555555;
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    background-color: #2b2b2b;
+                    color: white;
+                    font-size: 14px;
+                    selection-background-color: #4a5568;
+                }
+                QLineEdit:focus {
+                    border-color: #667eea;
+                    background-color: #3b3b3b;
+                    color: white;
+                }
+                QLineEdit:hover {
+                    border-color: #777777;
+                }
+            """)
+        else:
+            # 浅色主题样式
+            self.setStyleSheet("""
+                QLineEdit {
+                    border: 2px solid #e9ecef;
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    background-color: white;
+                    color: black;
+                    font-size: 14px;
+                    selection-background-color: #cce0ff;
+                }
+                QLineEdit:focus {
+                    border-color: #667eea;
+                    background-color: #f8f9ff;
+                    color: black;
+                }
+                QLineEdit:hover {
+                    border-color: #adb5bd;
+                }
+            """)
 
 class ModernTextEdit(QTextEdit):
     """现代化的多行文本输入框组件"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("""
-            QTextEdit {
-                border: 2px solid #e9ecef;
-                border-radius: 8px;
-                padding: 12px;
-                background-color: white;
-                font-size: 14px;
-                selection-background-color: #cce0ff;
-                line-height: 1.5;
-            }
-            QTextEdit:focus {
-                border-color: #667eea;
-                background-color: #f8f9ff;
-            }
-            QTextEdit:hover {
-                border-color: #adb5bd;
-            }
-        """)
+        self.apply_theme_style()
+    
+    def apply_theme_style(self):
+        """根据当前主题应用样式"""
+        # 检测是否为深色主题
+        palette = QApplication.instance().palette()
+        is_dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        
+        if is_dark:
+            # 深色主题样式
+            self.setStyleSheet("""
+                QTextEdit {
+                    border: 2px solid #555555;
+                    border-radius: 8px;
+                    padding: 12px;
+                    background-color: #2b2b2b;
+                    color: white;
+                    font-size: 14px;
+                    selection-background-color: #4a5568;
+                    line-height: 1.5;
+                }
+                QTextEdit:focus {
+                    border-color: #667eea;
+                    background-color: #3b3b3b;
+                    color: white;
+                }
+                QTextEdit:hover {
+                    border-color: #777777;
+                }
+            """)
+        else:
+            # 浅色主题样式
+            self.setStyleSheet("""
+                QTextEdit {
+                    border: 2px solid #e9ecef;
+                    border-radius: 8px;
+                    padding: 12px;
+                    background-color: white;
+                    color: black;
+                    font-size: 14px;
+                    selection-background-color: #cce0ff;
+                    line-height: 1.5;
+                }
+                QTextEdit:focus {
+                    border-color: #667eea;
+                    background-color: #f8f9ff;
+                    color: black;
+                }
+                QTextEdit:hover {
+                    border-color: #adb5bd;
+                }
+            """)
 
 class ModernProgressBar(QProgressBar):
     """现代化的进度条组件"""
@@ -416,6 +487,46 @@ class BatchAnalysisWorker(QThread):
                 pass
             self.error.emit(str(e))
 
+class QuickRecommendWorker(QThread):
+    """快速推荐列表线程（基于快照的轻量级推荐）"""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+    log_message = pyqtSignal(str, str)
+
+    def __init__(self, analyzer, top_n=20, min_mktcap_e=30.0, exclude_st=True, use_rule=False):
+        super().__init__()
+        self.analyzer = analyzer
+        self.top_n = top_n
+        self.min_mktcap_e = min_mktcap_e
+        self.exclude_st = exclude_st
+        self.use_rule = use_rule
+
+    def run(self):
+        try:
+            if self.use_rule:
+                self.log_message.emit("🚀 正在按7日规则筛选推荐列表（逐股近端校验）...", "info")
+                if not hasattr(self.analyzer, 'get_rule_based_recommendations'):
+                    raise RuntimeError("分析器不支持规则推荐接口")
+                res = self.analyzer.get_rule_based_recommendations(
+                    top_n=int(self.top_n),
+                    min_mktcap_e=float(self.min_mktcap_e),
+                    exclude_st=bool(self.exclude_st)
+                )
+            else:
+                self.log_message.emit("🚀 正在生成快速推荐列表（无需逐股深度拉取）...", "info")
+                if not hasattr(self.analyzer, 'get_quick_recommendations'):
+                    raise RuntimeError("分析器不支持快速推荐接口")
+                res = self.analyzer.get_quick_recommendations(
+                    top_n=int(self.top_n),
+                    min_mktcap_e=float(self.min_mktcap_e),
+                    exclude_st=bool(self.exclude_st)
+                )
+            self.log_message.emit(f"✅ 推荐生成完成，共 {len(res)} 条", "success")
+            self.finished.emit(res)
+        except Exception as e:
+            self.log_message.emit(f"❌ 生成推荐失败: {str(e)}", "error")
+            self.error.emit(str(e))
+
 class EnhancedScoreCard(QFrame):
     """增强版评分卡片组件"""
     def __init__(self, title, score, max_score=100, additional_info="", parent=None):
@@ -541,16 +652,16 @@ class DataQualityIndicator(QFrame):
 class ModernStockAnalyzerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        
+
         # 初始化日志显示（会在init_ui中创建）
         self.log_display = None
-        
+
         # 初始化UI
         self.init_ui()
         self.adjust_size_and_position()
-        
-        # 初始化分析器并显示状态
-        self.init_analyzer()
+
+        # 初始化分析器并显示状态（延后到事件循环启动后执行，避免启动期阻塞/崩溃）
+        QTimer.singleShot(0, self.init_analyzer)
 
     def init_analyzer(self):
         """初始化分析器并智能检测功能"""
@@ -682,14 +793,17 @@ class ModernStockAnalyzerGUI(QMainWindow):
             self.log_display.append_streaming_text(f"✅ akshare {akshare.__version__} 数据源连接正常", "success")
             
             # 测试akshare基本功能
-            try:
-                test_data = akshare.tool_trade_date_hist_sina()
-                if not test_data.empty:
-                    self.log_display.append_streaming_text("✅ akshare API测试成功", "success")
-                else:
-                    self.log_display.append_streaming_text("⚠️ akshare API响应为空，可能网络不稳定", "warning")
-            except Exception as e:
-                self.log_display.append_streaming_text(f"⚠️ akshare API测试失败: {str(e)[:50]}...", "warning")
+            if os.environ.get('STOCK_ANALYZER_SAFE_MODE') != '1':
+                try:
+                    test_data = akshare.tool_trade_date_hist_sina()
+                    if not test_data.empty:
+                        self.log_display.append_streaming_text("✅ akshare API测试成功", "success")
+                    else:
+                        self.log_display.append_streaming_text("⚠️ akshare API响应为空，可能网络不稳定", "warning")
+                except Exception as e:
+                    self.log_display.append_streaming_text(f"⚠️ akshare API测试失败: {str(e)[:50]}...", "warning")
+            else:
+                self.log_display.append_streaming_text("ℹ️ 安全模式：跳过 akshare 实时连通性测试", "info")
                 
         except ImportError:
             self.log_display.append_streaming_text("❌ akshare 未安装，数据获取将受限", "error")
@@ -853,7 +967,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(20)
-        
+
         # 创建标签页
         tab_widget = QTabWidget()
         tab_widget.setStyleSheet("""
@@ -881,22 +995,26 @@ class ModernStockAnalyzerGUI(QMainWindow):
                 color: black;
             }
         """)
-        
+
         # 单只股票分析标签页
         single_tab = self.create_single_stock_tab()
         tab_widget.addTab(single_tab, "📈 单只分析")
-        
+
         # 批量分析标签页
         batch_tab = self.create_batch_stock_tab()
         tab_widget.addTab(batch_tab, "📊 批量分析")
-        
+
+        # 推荐列表标签页
+        recommend_tab = self.create_recommend_tab()
+        tab_widget.addTab(recommend_tab, "🌟 推荐列表")
+
         layout.addWidget(tab_widget)
-        
+
         # 日志显示区域
         log_frame = ModernFrame()
         log_layout = QVBoxLayout(log_frame)
         log_layout.setContentsMargins(16, 16, 16, 16)
-        
+
         # 日志标题和控制按钮
         log_header = QHBoxLayout()
         log_label = QLabel('📋 分析日志')
@@ -910,23 +1028,124 @@ class ModernStockAnalyzerGUI(QMainWindow):
         """)
         log_header.addWidget(log_label)
         log_header.addStretch()
-        
+
         # 清空日志按钮
         clear_log_btn = ModernButton('🗑️ 清空', button_type="secondary")
         clear_log_btn.setMaximumWidth(80)
         clear_log_btn.clicked.connect(self.clear_log)
         log_header.addWidget(clear_log_btn)
-        
+
         log_layout.addLayout(log_header)
-        
+
         # 日志显示区域
         self.log_display = StreamingDisplay()
         self.log_display.setMaximumHeight(250)
         self.log_display.append_streaming_text("📋 系统就绪，等待分析任务...", "info")
         log_layout.addWidget(self.log_display)
-        
+
         layout.addWidget(log_frame)
-        
+
+        return widget
+
+    def create_recommend_tab(self):
+        """创建推荐列表标签页"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # 控件区域
+        ctrl_group = QGroupBox("生成条件")
+        ctrl_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                font-size: 14px;
+                color: black;
+                border: 2px solid #e9ecef;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 8px 0 8px;
+                background-color: white;
+            }
+        """)
+        grid = QGridLayout(ctrl_group)
+
+        # Top N
+        grid.addWidget(QLabel("Top N:"), 0, 0)
+        self.rec_topn_spin = QSpinBox()
+        self.rec_topn_spin.setRange(5, 200)
+        self.rec_topn_spin.setValue(10)
+        self.rec_topn_spin.setSingleStep(5)
+        grid.addWidget(self.rec_topn_spin, 0, 1)
+
+        # 最小市值(亿)
+        grid.addWidget(QLabel("最小总市值(亿):"), 0, 2)
+        self.rec_mcap_spin = QSpinBox()
+        self.rec_mcap_spin.setRange(0, 100000)
+        self.rec_mcap_spin.setValue(30)
+        self.rec_mcap_spin.setSingleStep(10)
+        grid.addWidget(self.rec_mcap_spin, 0, 3)
+
+        # 过滤ST
+        self.rec_exclude_st_cb = QCheckBox("排除ST/退市")
+        self.rec_exclude_st_cb.setChecked(True)
+        grid.addWidget(self.rec_exclude_st_cb, 0, 4)
+
+        # 使用7日规则筛选
+        self.rec_use_rule_cb = QCheckBox("按7日规则筛选")
+        self.rec_use_rule_cb.setChecked(False)
+        grid.addWidget(self.rec_use_rule_cb, 1, 0, 1, 2)
+
+        # 生成和导出按钮（放入条件组内更显眼）
+        btn_row = QHBoxLayout()
+        self.btn_gen_rec = ModernButton('🌟 生成推荐', button_type="primary")
+        self.btn_gen_rec.clicked.connect(self.start_quick_recommendations)
+        # 推荐页按钮统一改为黑色文字（覆盖默认primary白字），含悬停/按下/禁用态
+        self.btn_gen_rec.setStyleSheet(self.btn_gen_rec.styleSheet() + """
+            QPushButton { color: black; }
+            QPushButton:hover { color: black; }
+            QPushButton:pressed { color: black; }
+            QPushButton:disabled { color: black; }
+        """)
+        btn_row.addWidget(self.btn_gen_rec)
+
+        self.btn_export_rec = ModernButton('📤 导出推荐', button_type="secondary")
+        self.btn_export_rec.clicked.connect(self.export_recommendations)
+        # 次按钮本就为黑字，这里同样显式覆盖，确保各状态一致为黑字
+        self.btn_export_rec.setStyleSheet(self.btn_export_rec.styleSheet() + """
+            QPushButton { color: black; }
+            QPushButton:hover { color: black; }
+            QPushButton:pressed { color: black; }
+            QPushButton:disabled { color: black; }
+        """)
+        btn_row.addWidget(self.btn_export_rec)
+
+        btn_row.addStretch()
+        grid.addLayout(btn_row, 2, 0, 1, 5)
+        layout.addWidget(ctrl_group)
+
+        # 表格
+        self.rec_table = QTableWidget(0, 8)
+        self.rec_table.setHorizontalHeaderLabels([
+            '代码', '名称', '价格', '涨跌幅%', 'PE', '总市值(亿)', '得分', '建议'
+        ])
+        header = self.rec_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.rec_table.setSelectionBehavior(self.rec_table.SelectionBehavior.SelectRows)
+        self.rec_table.setEditTriggers(self.rec_table.EditTrigger.NoEditTriggers)
+        self.rec_table.doubleClicked.connect(self.on_recommend_row_double_clicked)
+        layout.addWidget(self.rec_table)
+
+        # 提示
+        hint = QLabel("提示：双击行可将代码填入左侧“单只分析”，便于进一步深度分析。")
+        hint.setStyleSheet("QLabel{color:#6c757d;font-size:12px;background:transparent;}")
+        layout.addWidget(hint)
+
         return widget
 
     def create_single_stock_tab(self):
@@ -1119,9 +1338,25 @@ class ModernStockAnalyzerGUI(QMainWindow):
                 padding: 20px;
                 background-color: white;
                 font-size: 14px;
-                line-height: 1.6;
+                line-height: 1.9; /* 加宽行距 */
             }
         """)
+        # 扩大段落间距与表格行高
+        try:
+            doc_css = """
+                <style>
+                  body { line-height: 1.9; }
+                  p { margin: 10px 0 14px 0; }
+                  ul, ol { margin: 10px 0 14px 22px; }
+                  table { border-collapse: collapse; width: 100%; }
+                  th, td { padding: 8px 10px; }
+                  h2 { margin-top: 20px; margin-bottom: 10px; }
+                  h3 { margin-top: 16px; margin-bottom: 8px; }
+                </style>
+            """
+            self.result_browser.document().setDefaultStyleSheet(doc_css)
+        except Exception:
+            pass
         layout.addWidget(self.result_browser)
         
         return widget
@@ -1129,12 +1364,12 @@ class ModernStockAnalyzerGUI(QMainWindow):
     def format_enhanced_report(self, report, is_single=True):
         """格式化增强版分析报告"""
         stock_name = report.get('stock_name', report['stock_code'])
-        
+
         # 获取数据质量信息
-        data_quality = report.get('data_quality', {})
+        data_quality = report.get('data_quality', {}) or {}
         financial_count = data_quality.get('financial_indicators_count', 0)
-        news_count = report.get('sentiment_analysis', {}).get('total_analyzed', 0)
-        
+        news_count = (report.get('sentiment_analysis') or {}).get('total_analyzed', 0)
+
         md = f"""# 📈 股票分析报告 ({ANALYZER_VERSION})
 
 ## 🏢 基本信息
@@ -1182,12 +1417,10 @@ class ModernStockAnalyzerGUI(QMainWindow):
 """
 
         # 添加财务指标详情（如果有的话）
-        fundamental_data = report.get('fundamental_data', {})
-        financial_indicators = fundamental_data.get('financial_indicators', {})
-        
+        fundamental_data = report.get('fundamental_data', {}) or {}
+        financial_indicators = fundamental_data.get('financial_indicators', {}) or {}
         if financial_indicators:
             md += "\n| 指标名称 | 数值 |\n|----------|------|\n"
-            # 显示前10个重要的财务指标
             count = 0
             for key, value in financial_indicators.items():
                 if count >= 10:
@@ -1199,8 +1432,119 @@ class ModernStockAnalyzerGUI(QMainWindow):
             md += "\n基本面数据包含了公司的财务状况、估值水平、盈利能力等关键指标的综合评估。\n"
 
         # 继续添加其他部分
-        sentiment_analysis = report.get('sentiment_analysis', {})
-        
+        sentiment_analysis = report.get('sentiment_analysis', {}) or {}
+
+        # 行业信息（多口径显示）
+        ind = (report.get('fundamental_data') or {}).get('industry_analysis') or {}
+        if ind:
+            name_primary = ind.get('industry_name_primary') or ind.get('industry_name') or '未知'
+            bs_name = ind.get('baostock_industry_name')
+            source = ind.get('industry_source') or '未知'
+            tags = ind.get('industry_tags') or []
+            tag_str = ' | '.join([t for t in tags if t]) if tags else (bs_name or name_primary)
+            md += f"""
+
+### 🏭 行业信息
+
+| 项目 | 值 |
+|------|-----|
+| 主口径(东财) | {name_primary} |
+| 其他口径(BaoStock) | {bs_name or '-'} |
+| 行业标签 | {tag_str} |
+| 成份来源 | {source} |
+"""
+
+        # 关键均线补充
+        ta = report.get('technical_analysis', {}) or {}
+        ma20 = ta.get('ma20')
+        ma50 = ta.get('ma50')
+        p_ma20 = ta.get('price_vs_ma20_pct')
+        p_ma50 = ta.get('price_vs_ma50_pct')
+        if any(v is not None for v in [ma20, ma50, p_ma20, p_ma50]):
+            ma20_txt = f"{ma20:.2f}" if isinstance(ma20, (int, float)) else "-"
+            ma50_txt = f"{ma50:.2f}" if isinstance(ma50, (int, float)) else "-"
+            p_ma20_txt = f"{p_ma20:.2f}%" if isinstance(p_ma20, (int, float)) else "-"
+            p_ma50_txt = f"{p_ma50:.2f}%" if isinstance(p_ma50, (int, float)) else "-"
+            md += f"""
+
+### 📐 关键均线
+
+| 指标 | 数值 |
+|------|------|
+| MA20 | {ma20_txt} |
+| MA50 | {ma50_txt} |
+| 价格相对MA20 | {p_ma20_txt} |
+| 价格相对MA50 | {p_ma50_txt} |
+"""
+
+        # 资金流向（近1个月）
+        cf = report.get('capital_flow') or {}
+        if cf:
+            def fmt_amt(v):
+                try:
+                    x = float(v)
+                except Exception:
+                    return '-'
+                # 自适应单位
+                absx = abs(x)
+                if absx >= 1e9:
+                    return f"{x/1e9:.2f} 亿元"
+                if absx >= 1e8:
+                    return f"{x/1e8:.2f} 亿元"
+                if absx >= 1e6:
+                    return f"{x/1e6:.2f} 百万元"
+                if absx >= 1e4:
+                    return f"{x/1e4:.2f} 万元"
+                return f"{x:.0f} 元"
+
+            def fmt_ratio(r):
+                try:
+                    return f"{float(r)*100:.2f}%"
+                except Exception:
+                    return '-'
+
+            buckets = cf.get('buckets') or {}
+            main_status = cf.get('status', '数据不足')
+            main_net = cf.get('main_force_net')
+            main_ratio = cf.get('main_force_ratio_to_turnover')
+            sum_amount = cf.get('sum_amount')
+
+            md += f"""
+
+## 💵 资金流向（近1个月）
+
+| 项目 | 值 |
+|------|-----|
+| 主力净流入状态 | {main_status} |
+| 主力净额 | {fmt_amt(main_net)} |
+| 主力净流入/成交额 | {fmt_ratio(main_ratio)} |
+| 统计口径 | {cf.get('note','')} |
+"""
+
+            # 桶映射
+            name_map = {
+                'extra_large': '特大单',
+                'large': '大单',
+                'medium': '中单',
+                'small': '小单'
+            }
+            rows = []
+            for k in ['extra_large', 'large', 'medium', 'small']:
+                b = buckets.get(k) or {}
+                rows.append(
+                    (name_map[k], fmt_amt(b.get('net')), fmt_ratio(b.get('ratio_to_turnover')), f"{b.get('pos_days',0)}/{b.get('neg_days',0)}", b.get('status','-'))
+                )
+
+            md += """
+
+### 分档净流入明细
+
+| 档位 | 净额 | 净/成交额 | 正天数/负天数 | 状态 |
+|------|------|-----------|---------------|------|
+"""
+            for row in rows:
+                md += f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} |\n"
+
         md += f"""
 
 ## 📰 市场情绪分析
@@ -1215,10 +1559,10 @@ class ModernStockAnalyzerGUI(QMainWindow):
 
 ### 📊 新闻数据分布
 """
-        
+
         # 添加新闻分布信息
         if 'news_summary' in sentiment_analysis:
-            news_summary = sentiment_analysis['news_summary']
+            news_summary = sentiment_analysis.get('news_summary') or {}
             md += f"""
 | 新闻类型 | 数量 |
 |----------|------|
@@ -1377,35 +1721,183 @@ class ModernStockAnalyzerGUI(QMainWindow):
         # 存储最新批量报告用于导出
         self.latest_batch_report = recommendations
 
+    def start_quick_recommendations(self):
+        """触发生成快速推荐列表"""
+        try:
+            topn = int(self.rec_topn_spin.value())
+            mcap = float(self.rec_mcap_spin.value())
+            excl = bool(self.rec_exclude_st_cb.isChecked())
+            use_rule = bool(self.rec_use_rule_cb.isChecked()) if hasattr(self, 'rec_use_rule_cb') else False
+        except Exception as e:
+            self.show_warning(f'参数读取失败：{e}')
+            return
+
+        if not hasattr(self, 'analyzer'):
+            self.show_warning('分析器尚未初始化完成')
+            return
+
+        self.btn_gen_rec.setEnabled(False)
+        self.rec_table.setRowCount(0)
+        self.log_display.append_streaming_text("🌟 开始生成推荐列表...", "info")
+
+        # 启动后台线程
+        self.rec_worker = QuickRecommendWorker(self.analyzer, topn, mcap, excl, use_rule)
+        self.rec_worker.finished.connect(self.handle_recommendations_result)
+        self.rec_worker.error.connect(self.handle_analysis_error)
+        self.rec_worker.log_message.connect(self.log_display.append_streaming_text)
+        self.rec_worker.start()
+
+    def handle_recommendations_result(self, rows):
+        """填充推荐表格"""
+        try:
+            self.rec_table.setRowCount(0)
+            for item in rows:
+                row = self.rec_table.rowCount()
+                self.rec_table.insertRow(row)
+                vals = [
+                    item.get('stock_code',''),
+                    item.get('stock_name',''),
+                    f"{item.get('latest_price',0.0):.2f}",
+                    f"{item.get('change_pct',0.0):.2f}",
+                    f"{item.get('pe',0.0):.2f}",
+                    f"{item.get('mktcap_e',0.0):.2f}",
+                    f"{item.get('score',0.0):.1f}",
+                    item.get('recommendation','')
+                ]
+                for c, v in enumerate(vals):
+                    self.rec_table.setItem(row, c, QTableWidgetItem(str(v)))
+            self.latest_recommendations = rows
+            self.log_display.append_streaming_text("✅ 推荐列表已更新，可双击行进行深度分析", "success")
+        except Exception as e:
+            self.show_error(f"填充推荐表格失败：{e}")
+        finally:
+            self.btn_gen_rec.setEnabled(True)
+
+    def on_recommend_row_double_clicked(self, index):
+        """双击推荐行：将代码带入单只分析输入框并切换到单只分析页"""
+        try:
+            row = index.row()
+            code_item = self.rec_table.item(row, 0)
+            if code_item:
+                code = code_item.text().strip()
+                self.single_stock_input.setText(code)
+                self.log_display.append_streaming_text(f"➡️ 已选中推荐：{code}，可直接点击左侧‘开始深度分析’", "info")
+        except Exception:
+            pass
+
+    def export_recommendations(self):
+        """导出推荐列表为 Markdown"""
+        try:
+            if not hasattr(self, 'latest_recommendations') or not self.latest_recommendations:
+                self.show_warning('暂无可导出的推荐列表')
+                return
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"recommendations_{ts}.md"
+            lines = [
+                f"# 🌟 快速推荐列表 ({ANALYZER_VERSION})\n",
+                f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n",
+                "| 代码 | 名称 | 价格 | 涨跌幅% | PE | 总市值(亿) | 得分 | 建议 |\n",
+                "|------|------|------|--------|----|-----------|------|------|\n"
+            ]
+            for it in self.latest_recommendations:
+                lines.append(
+                    f"| {it.get('stock_code','')} | {it.get('stock_name','')} | {it.get('latest_price',0.0):.2f} | {it.get('change_pct',0.0):.2f} | {it.get('pe',0.0):.2f} | {it.get('mktcap_e',0.0):.2f} | {it.get('score',0.0):.1f} | {it.get('recommendation','')} |\n"
+                )
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            self.log_display.append_streaming_text(f"✅ 推荐列表已导出：{filename}", "success")
+            QMessageBox.information(self, '导出成功', f'推荐列表已导出到 {filename}')
+        except Exception as e:
+            self.show_error(f"导出推荐列表失败：{e}")
+
     def update_score_cards(self, scores):
         """更新评分卡片"""
-        # 清空现有卡片
-        for i in reversed(range(self.score_layout.count())): 
-            self.score_layout.itemAt(i).widget().setParent(None)
-        
-        # 创建新的增强版评分卡片
-        comprehensive_card = EnhancedScoreCard("综合得分", scores['comprehensive'], 
-                                             additional_info=self.get_score_description(scores['comprehensive']))
-        technical_card = EnhancedScoreCard("技术分析", scores['technical'],
-                                         additional_info=self.get_score_description(scores['technical']))
-        fundamental_card = EnhancedScoreCard("基本面", scores['fundamental'],
-                                           additional_info=self.get_score_description(scores['fundamental']))
-        sentiment_card = EnhancedScoreCard("市场情绪", scores['sentiment'],
-                                         additional_info=self.get_score_description(scores['sentiment']))
-        
-        self.score_layout.addWidget(comprehensive_card)
-        self.score_layout.addWidget(technical_card)
-        self.score_layout.addWidget(fundamental_card)
-        self.score_layout.addWidget(sentiment_card)
-        self.score_layout.addStretch()
-        
-        self.score_frame.setVisible(True)
+        # 先安全清空现有卡片（同时处理 QSpacerItem）
+        try:
+            for i in reversed(range(self.score_layout.count())):
+                item = self.score_layout.takeAt(i)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+        except Exception:
+            pass
+
+        # 安全提取分数（缺失则为 None）
+        def to_float(v):
+            try:
+                if v is None:
+                    return None
+                f = float(v)
+                return f if math.isfinite(f) else None
+            except Exception:
+                return None
+
+        comp = to_float((scores or {}).get('comprehensive'))
+        tech = to_float((scores or {}).get('technical'))
+        fund = to_float((scores or {}).get('fundamental'))
+        senti = to_float((scores or {}).get('sentiment'))
+
+        available = [x for x in [comp, tech, fund, senti] if x is not None]
+
+        try:
+            if not available:
+                # 无有效分数，显示占位提示，避免空白误导
+                placeholder = QLabel("⏳ 评分尚未生成或计算失败，请查看左侧日志")
+                placeholder.setStyleSheet("""
+                    QLabel { color: #6c757d; font-size: 13px; font-style: italic; background: transparent; }
+                """)
+                self.score_layout.addWidget(placeholder)
+                self.score_layout.addStretch()
+                if hasattr(self, 'log_display') and self.log_display:
+                    self.log_display.append_streaming_text("评分卡片：未收到有效分数，已显示占位提示", "warning")
+                self.score_frame.setVisible(True)
+                return
+
+            # 用 0.0 兜底缺失项，保证卡片完整
+            comp = comp if comp is not None else 0.0
+            tech = tech if tech is not None else 0.0
+            fund = fund if fund is not None else 0.0
+            senti = senti if senti is not None else 0.0
+
+            # 创建新的增强版评分卡片
+            comprehensive_card = EnhancedScoreCard("综合得分", comp, 
+                                                 additional_info=self.get_score_description(comp))
+            technical_card = EnhancedScoreCard("技术分析", tech,
+                                             additional_info=self.get_score_description(tech))
+            fundamental_card = EnhancedScoreCard("基本面", fund,
+                                               additional_info=self.get_score_description(fund))
+            sentiment_card = EnhancedScoreCard("市场情绪", senti,
+                                             additional_info=self.get_score_description(senti))
+
+            self.score_layout.addWidget(comprehensive_card)
+            self.score_layout.addWidget(technical_card)
+            self.score_layout.addWidget(fundamental_card)
+            self.score_layout.addWidget(sentiment_card)
+            self.score_layout.addStretch()
+        except Exception as e:
+            # 任意异常时显示占位并记录日志
+            placeholder = QLabel(f"评分卡片生成失败：{str(e)}")
+            placeholder.setStyleSheet("""
+                QLabel { color: #e74c3c; font-size: 13px; font-style: italic; background: transparent; }
+            """)
+            self.score_layout.addWidget(placeholder)
+            self.score_layout.addStretch()
+            if hasattr(self, 'log_display') and self.log_display:
+                self.log_display.append_streaming_text(f"评分卡片生成失败：{str(e)}", "error")
+        finally:
+            self.score_frame.setVisible(True)
 
     def update_data_quality_indicators(self, report):
         """更新数据质量指示器"""
-        # 清空现有指示器
-        for i in reversed(range(self.data_quality_layout.count())): 
-            self.data_quality_layout.itemAt(i).widget().setParent(None)
+        # 清空现有指示器（同时处理 QSpacerItem）
+        try:
+            for i in reversed(range(self.data_quality_layout.count())):
+                item = self.data_quality_layout.takeAt(i)
+                w = item.widget()
+                if w is not None:
+                    w.deleteLater()
+        except Exception:
+            pass
         
         # 创建数据质量指示器
         data_quality = report.get('data_quality', {})
@@ -1490,6 +1982,19 @@ class ModernStockAnalyzerGUI(QMainWindow):
                 # 计算统计信息
                 total_financial = sum(r.get('data_quality', {}).get('financial_indicators_count', 0) for r in self.latest_batch_report)
                 total_news = sum(r.get('sentiment_analysis', {}).get('total_analyzed', 0) for r in self.latest_batch_report)
+                
+            elif hasattr(self, 'latest_recommendations'):
+                # 导出推荐列表
+                filename = f"recommendations_{timestamp}.md"
+                content = "# 🌟 快速推荐列表\n\n"
+                content += f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                content += "| 代码 | 名称 | 价格 | 涨跌幅% | PE | 总市值(亿) | 得分 | 建议 |\n"
+                content += "|------|------|------|--------|----|-----------|------|------|\n"
+                for it in getattr(self, 'latest_recommendations', []):
+                    content += (
+                        f"| {it.get('stock_code','')} | {it.get('stock_name','')} | {it.get('latest_price',0.0):.2f} | {it.get('change_pct',0.0):.2f} | {it.get('pe',0.0):.2f} | {it.get('mktcap_e',0.0):.2f} | {it.get('score',0.0):.1f} | {it.get('recommendation','')} |\n"
+                    )
+                report_type = f"推荐列表({len(getattr(self, 'latest_recommendations', []))}条)"
                 
             else:
                 self.log_display.append_streaming_text("⚠️ 没有可导出的报告", "warning")
@@ -1615,73 +2120,94 @@ class ModernStockAnalyzerGUI(QMainWindow):
         error.exec()
 
 def main():
-    # 设置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),  # 控制台输出
-        ]
-    )
+    # 导入配置模块
+    try:
+        from gui_config import setup_environment, setup_logging, get_app_config, check_dependencies
+        
+        # 设置环境变量
+        setup_environment()
+        
+        # 设置日志
+        logger = setup_logging()
+        
+        # 获取应用配置
+        app_config = get_app_config()
+        
+        # 检查依赖
+        deps_status = check_dependencies()
+        if not deps_status['all_satisfied']:
+            logger.error(f"缺少必需依赖: {', '.join(deps_status['missing_required'])}")
+            missing_deps = deps_status['missing_required']
+        else:
+            missing_deps = []
+            if deps_status['missing_optional']:
+                logger.info(f"可选依赖未安装: {', '.join(deps_status['missing_optional'])}")
+    
+    except ImportError:
+        # 如果配置模块不存在，使用默认配置
+        # macOS 稳定性增强
+        os.environ.setdefault('QT_MAC_WANTS_LAYER', '1')
+        os.environ.setdefault('QT_ENABLE_HIGHDPI_SCALING', '1')
+        os.environ.setdefault('QT_AUTO_SCREEN_SCALE_FACTOR', '1')
+        os.environ.setdefault('QT_LOGGING_RULES', '*.debug=false;qt.qpa.*=false')
+        
+        # 设置日志
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(),
+            ]
+        )
+        
+        logger = logging.getLogger(__name__)
+        app_config = {'app_name': '现代股票分析系统', 'app_version': '3.0'}
+        missing_deps = []
     
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setStyle(app_config.get('theme', {}).get('style', 'Fusion'))
     
     # 设置应用图标和基本信息
-    app.setApplicationName("现代股票分析系统")
-    app.setApplicationVersion("3.0")
-    app.setOrganizationName("Smart Stock Analyzer Team")
+    app.setApplicationName(app_config.get('app_name', '现代股票分析系统'))
+    app.setApplicationVersion(app_config.get('app_version', '3.0'))
+    app.setOrganizationName(app_config.get('organization', 'Smart Stock Analyzer Team'))
     
-    print("🚀 启动现代股票分析系统...")
-    print("📋 系统信息:")
-    print(f"   - Python版本: {sys.version}")
-    print(f"   - PyQt6版本: {QApplication.applicationVersion()}")
-    print(f"   - 分析器文件: stock_analyzer.py")
-    print(f"   - 分析器类: {ANALYZER_CLASS.__name__}")
-    print(f"   - 预设版本: {ANALYZER_VERSION}")
-    print("   - 实际功能: 将在初始化时检测")
-    
-    # 检查依赖
-    missing_deps = []
-    try:
-        import akshare
-        print("   ✅ akshare: 已安装")
-    except ImportError:
-        missing_deps.append("akshare")
-        print("   ❌ akshare: 未安装")
-    
-    try:
-        import jieba
-        print("   ✅ jieba: 已安装")
-    except ImportError:
-        missing_deps.append("jieba")
-        print("   ❌ jieba: 未安装")
-    
-    try:
-        import markdown2
-        print("   ✅ markdown2: 已安装")
-    except ImportError:
-        missing_deps.append("markdown2")
-        print("   ❌ markdown2: 未安装")
+    logger.info("🚀 启动现代股票分析系统...")
+    logger.info("📋 系统信息:")
+    logger.info(f"   - Python版本: {sys.version.split()[0]}")
+    logger.info(f"   - PyQt6版本: {QApplication.applicationVersion()}")
+    logger.info(f"   - 应用版本: {app_config.get('app_version', '3.0')}")
+    logger.info(f"   - 分析器类: {ANALYZER_CLASS.__name__}")
+    logger.info(f"   - 预设版本: {ANALYZER_VERSION}")
+    logger.info("   - 实际功能: 将在初始化时检测")
     
     if missing_deps:
         error_msg = f"缺少必要依赖: {', '.join(missing_deps)}\n\n请运行以下命令安装:\npip install {' '.join(missing_deps)}"
-        QMessageBox.critical(None, "依赖检查失败", error_msg)
-        print(f"❌ 依赖检查失败: {error_msg}")
+        logger.error(f"❌ 依赖检查失败: {error_msg}")
+        # 避免在窗口未完全初始化时弹出模态对话框导致崩溃
+        try:
+            QMessageBox.critical(None, "依赖检查失败", error_msg)
+        except Exception:
+            pass
         sys.exit(1)
     
     # 创建并显示主窗口
     try:
-        print("🎨 正在创建用户界面...")
+        logger.info("🎨 正在创建用户界面...")
         window = ModernStockAnalyzerGUI()
         window.show()
-        print("✅ 系统启动成功！")
-        print("💡 系统将自动检测分析器功能并适配界面")
+        logger.info("✅ 系统启动成功！")
+        logger.info("💡 系统将自动检测分析器功能并适配界面")
         sys.exit(app.exec())
     except Exception as e:
         error_msg = f"程序启动失败：{str(e)}"
-        print(f"❌ {error_msg}")
-        QMessageBox.critical(None, "启动错误", error_msg)
+        logger.error(f"❌ {error_msg}")
+        import traceback
+        logger.error(traceback.format_exc())
+        try:
+            QMessageBox.critical(None, "启动错误", error_msg)
+        except:
+            pass
         sys.exit(1)
 
 if __name__ == '__main__':
