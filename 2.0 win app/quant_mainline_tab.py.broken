@@ -1,0 +1,766 @@
+"""
+量化主线共振狙击系统 - GUI标签页模块
+集成到现有GUI界面
+"""
+
+import sys
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+                             QLabel, QTextBrowser, QGroupBox, QTableWidget,
+                             QTableWidgetItem, QHeaderView, QSplitter, QFrame,
+                             QMessageBox, QProgressBar, QComboBox, QSpinBox)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont, QColor
+from datetime import datetime
+import json
+
+class QuantMainlineThread(QThread):
+    """量化分析线程 - 避免阻塞GUI"""
+    progress = pyqtSignal(int, str)  # 进度和消息
+    finished = pyqtSignal(dict)  # 分析完成，返回结果
+    error = pyqtSignal(str)  # 错误信息
+    
+    def __init__(se        report.append("---\n")
+        report.append("*本报告由量化主线共振狙击系统自动生成*")
+        
+        return "\n".join(report)
+    
+    def update_summary_display(self, summary: Dict):
+        """更新预测摘要显示（新增）"""
+        html = []
+        html.append("<div style='font-family: Arial, sans-serif;'>")
+        
+        # 核心预测
+        confidence_color = {
+            '高': '#4caf50',
+            '中': '#ff9800', 
+            '低': '#9e9e9e'
+        }.get(summary['top_mainline_confidence'], '#999')
+        
+        html.append(f"""
+            <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                        color: white; padding: 15px; border-radius: 8px; margin-bottom: 10px;'>
+                <h3 style='margin: 0 0 5px 0;'>🎯 预测主线: {summary['top_mainline']}</h3>
+                <p style='margin: 5px 0;'>
+                    <strong>强度分:</strong> {summary['top_mainline_score']:.1f} &nbsp;|&nbsp;
+                    <strong>置信度:</strong> <span style='background: {confidence_color}; padding: 2px 8px; 
+                                                    border-radius: 4px;'>{summary['top_mainline_confidence']}</span>
+                </p>
+            </div>
+        """)
+        
+        # 核心依据
+        if summary.get('core_reasons'):
+            html.append("<div style='margin-bottom: 10px;'>")
+            html.append("<strong>📊 核心依据:</strong><ul style='margin: 5px 0; padding-left: 20px;'>")
+            for reason in summary['core_reasons'][:3]:
+                html.append(f"<li>{reason}</li>")
+            html.append("</ul></div>")
+        
+        # 操作建议
+        html.append(f"""
+            <div style='background: #fff3cd; padding: 12px; border-radius: 6px; border-left: 4px solid #ffc107;'>
+                <strong>💡 操作建议:</strong> {summary['action_recommendation']}<br>
+                <strong>⏰ 入场时机:</strong> {summary['entry_timing']}<br>
+                <strong>📊 仓位建议:</strong> {summary['position_sizing']}
+            </div>
+        """)
+        
+        # 风险提示
+        if summary.get('risk_warnings'):
+            html.append("<div style='margin-top: 10px; background: #f8d7da; padding: 10px; border-radius: 6px;'>")
+            html.append("<strong>⚠️ 风险提示:</strong><ul style='margin: 5px 0; padding-left: 20px;'>")
+            for warning in summary['risk_warnings'][:2]:
+                html.append(f"<li>{warning}</li>")
+            html.append("</ul></div>")
+        
+        html.append("</div>")
+        
+        self.summary_text.setHtml("".join(html))analyzer, mode='pre_market'):
+        super().__init__()
+        self.analyzer = analyzer
+        self.mode = mode  # 'pre_market' 或 'monitor'
+    
+    def run(self):
+        """执行量化分析"""
+        try:
+            if self.mode == 'pre_market':
+                self._run_pre_market_scan()
+            elif self.mode == 'monitor':
+                self._run_intraday_monitor()
+        except Exception as e:
+            self.error.emit(f"分析出错: {str(e)}")
+    
+    def _run_pre_market_scan(self):
+        """盘前扫描 - 使用预测型引擎"""
+        try:
+            # 尝试导入预测引擎
+            from mainline_engine.predictive_mainline_identifier import PredictiveMainlineEngine
+            from leader_monitor.predictive_leader_selector import PredictiveLeaderMonitor
+            from prediction_aggregator.summary_generator import PredictionAggregator
+            import json
+            
+            # 加载配置
+            try:
+                with open('config/predictive_quant_config.json', 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+            except:
+                config = {}
+            
+            self.progress.emit(10, "🔮 正在启动预测型主线识别引擎...")
+            
+            # 初始化引擎
+            mainline_engine = PredictiveMainlineEngine(self.analyzer, config.get('mainline_engine', {}))
+            leader_monitor = PredictiveLeaderMonitor(self.analyzer, config.get('leader_monitor', {}))
+            aggregator = PredictionAggregator(config.get('prediction_aggregator', {}))
+            
+            # 1. 识别预测主线
+            self.progress.emit(20, "🔍 正在识别预测型主线...")
+            mainlines = mainline_engine.identify_predictive_mainlines()
+            self.progress.emit(40, f"✅ 识别到 {len(mainlines)} 个预测主线")
+            
+            # 2. 构建龙头股池
+            self.progress.emit(50, "👑 正在构建预测型龙头股池...")
+            leaders = leader_monitor.build_predictive_leader_pool(mainlines)
+            self.progress.emit(70, f"✅ 龙头股池包含 {len(leaders)} 只股票")
+            
+            # 3. 识别超跌候选
+            self.progress.emit(80, "🎣 正在识别增强型超跌候选...")
+            oversold = leader_monitor.identify_enhanced_oversold_candidates(leaders, mainlines)
+            self.progress.emit(90, f"✅ 发现 {len(oversold)} 个超跌机会")
+            
+            # 4. 生成预测摘要
+            self.progress.emit(95, "🔮 正在生成预测摘要...")
+            summary = aggregator.generate_prediction_summary(mainlines, leaders, oversold)
+            
+            self.progress.emit(100, f"✅ 预测分析完成")
+            
+            # 格式化结果（转为GUI显示格式）
+            results = {
+                'mainlines': [self._format_mainline(ml) for ml in mainlines],
+                'leaders': [self._format_leader(ld) for ld in leaders],
+                'oversold': [self._format_oversold(os) for os in oversold],
+                'summary': summary.to_dict(),
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'mode': 'predictive'
+            }
+            
+            self.finished.emit(results)
+            
+        except ImportError as e:
+            # 如果导入失败，回退到模拟数据
+            self.progress.emit(10, f"⚠️ 预测引擎未加载: {str(e)}")
+            self.progress.emit(20, "📊 使用模拟数据展示...")
+            self._run_mock_scan()
+        except Exception as e:
+            self.error.emit(f"预测引擎错误: {str(e)}")
+    
+    def _run_mock_scan(self):
+        """模拟扫描（兼容旧版）"""
+        self.progress.emit(10, "🔍 正在识别主线行业...")
+        mainlines = self._mock_mainlines()
+        self.progress.emit(40, f"✅ 识别到 {len(mainlines)} 个主线行业")
+        
+        self.progress.emit(50, "👑 正在构建龙头股池...")
+        leaders = self._mock_leaders()
+        self.progress.emit(70, f"✅ 龙头股池包含 {len(leaders)} 只股票")
+        
+        self.progress.emit(80, "🎣 正在识别超跌候选...")
+        oversold = self._mock_oversold()
+        self.progress.emit(100, f"✅ 发现 {len(oversold)} 个超跌机会")
+        
+        results = {
+            'mainlines': mainlines,
+            'leaders': leaders,
+            'oversold': oversold,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'mode': 'mock'
+        }
+        
+        self.finished.emit(results)
+    
+    def _format_mainline(self, ml) -> dict:
+        """格式化预测主线为GUI显示格式"""
+        return {
+            'rank': ml.rank,
+            'industry': ml.industry_name,
+            'score': ml.prediction_score,
+            'status': ml.status.value,
+            'days': ml.continuity_days,
+            'stocks': ml.total_stocks,
+            'strong': ml.strong_stocks,
+            # 新增预测信息
+            'prediction_score': ml.prediction_score,
+            'current_score': ml.current_score,
+            'momentum_accel': ml.momentum_acceleration,
+            'internal_strength': ml.internal_strength,
+            'confidence': ml.prediction_confidence
+        }
+    
+    def _format_leader(self, ld) -> dict:
+        """格式化预测龙头为GUI显示格式"""
+        return {
+            'code': ld.stock_code,
+            'name': ld.stock_name,
+            'type': ld.leader_type,
+            'industry': ld.industry,
+            'score': ld.leader_score,
+            'tech': ld.technical_score,
+            'fund': ld.capital_score,
+            'flow': ld.capital_flow_3d.get('main_force_net', 0),
+            # 新增预测信息
+            'boost': ld.prediction_boost,
+            'in_mainline': ld.in_predictive_mainline,
+            'mainline_rank': ld.mainline_rank
+        }
+    
+    def _format_oversold(self, os) -> dict:
+        """格式化超跌候选为GUI显示格式"""
+        return {
+            'code': os.stock_code,
+            'name': os.stock_name,
+            'coefficient': os.adjusted_coefficient,
+            'drawdown': os.drawdown_from_high,
+            'divergence': os.technical_divergence,
+            'support': os.support_level,
+            'price': os.current_price,
+            # 新增预测信息
+            'boost': os.position_boost,
+            'potential': os.rebound_potential,
+            'target': os.target_price
+        }
+    
+    def _mock_mainlines(self):
+        """模拟主线数据 - 实际使用时替换为MainlineEngine"""
+        return [
+            {'rank': 1, 'industry': '新能源汽车', 'score': 85.2, 'status': '强势主线', 'days': 5, 'stocks': 45, 'strong': 12},
+            {'rank': 2, 'industry': '半导体芯片', 'score': 78.6, 'status': '强势主线', 'days': 3, 'stocks': 38, 'strong': 9},
+            {'rank': 3, 'industry': '人工智能', 'score': 72.4, 'status': '新兴主线', 'days': 2, 'stocks': 52, 'strong': 11},
+            {'rank': 4, 'industry': '生物医药', 'score': 68.9, 'status': '新兴主线', 'days': 1, 'stocks': 41, 'strong': 7},
+            {'rank': 5, 'industry': '5G通信', 'score': 65.3, 'status': '观察中', 'days': 1, 'stocks': 33, 'strong': 5},
+        ]
+    
+    def _mock_leaders(self):
+        """模拟龙头数据"""
+        return [
+            {'code': '300750', 'name': '宁德时代', 'type': '综合龙头', 'industry': '新能源汽车', 
+             'score': 92.5, 'tech': 88, 'fund': 95, 'flow': 5.68},
+            {'code': '002594', 'name': '比亚迪', 'type': '综合龙头', 'industry': '新能源汽车',
+             'score': 89.3, 'tech': 85, 'fund': 91, 'flow': 3.42},
+            {'code': '688981', 'name': '中芯国际', 'type': '资金龙头', 'industry': '半导体芯片',
+             'score': 86.7, 'tech': 82, 'fund': 89, 'flow': 6.25},
+            {'code': '300142', 'name': '科大讯飞', 'type': '综合龙头', 'industry': '人工智能',
+             'score': 84.2, 'tech': 80, 'fund': 86, 'flow': 2.15},
+            {'code': '600519', 'name': '贵州茅台', 'type': '综合龙头', 'industry': '白酒',
+             'score': 82.8, 'tech': 78, 'fund': 85, 'flow': 1.89},
+        ]
+    
+    def _mock_oversold(self):
+        """模拟超跌数据"""
+        return [
+            {'code': '002415', 'name': '海康威视', 'coefficient': 0.72, 'drawdown': 18.5, 
+             'divergence': True, 'support': 42.30, 'price': 43.80},
+            {'code': '300059', 'name': '东方财富', 'coefficient': 0.68, 'drawdown': 15.2,
+             'divergence': True, 'support': 18.50, 'price': 19.20},
+            {'code': '000858', 'name': '五粮液', 'coefficient': 0.65, 'drawdown': 12.8,
+             'divergence': False, 'support': 156.00, 'price': 162.50},
+        ]
+    
+    def _run_intraday_monitor(self):
+        """盘中监控 - 待实现"""
+        self.progress.emit(50, "📡 盘中监控功能开发中...")
+        self.progress.emit(100, "✅ 监控设置完成")
+
+
+class QuantMainlineTab(QWidget):
+    """量化主线共振狙击系统标签页"""
+    
+    def __init__(self, analyzer, parent=None):
+        super().__init__(parent)
+        self.analyzer = analyzer
+        self.current_results = None
+        self.init_ui()
+    
+    def init_ui(self):
+        """初始化UI"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # 顶部标题和控制区
+        header_layout = QHBoxLayout()
+        
+        title_label = QLabel('🎯 量化主线共振狙击系统')
+        title_label.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #1a73e8;
+                padding: 10px;
+            }
+        """)
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        
+        # 操作按钮组
+        self.scan_btn = QPushButton('🔍 盘前扫描')
+        self.scan_btn.setStyleSheet(self._get_button_style('primary'))
+        self.scan_btn.clicked.connect(self.run_pre_market_scan)
+        header_layout.addWidget(self.scan_btn)
+        
+        self.monitor_btn = QPushButton('📡 盘中监控')
+        self.monitor_btn.setStyleSheet(self._get_button_style('secondary'))
+        self.monitor_btn.setEnabled(False)  # 待实现
+        header_layout.addWidget(self.monitor_btn)
+        
+        self.export_btn = QPushButton('📥 导出报告')
+        self.export_btn.setStyleSheet(self._get_button_style('secondary'))
+        self.export_btn.clicked.connect(self.export_report)
+        self.export_btn.setEnabled(False)
+        header_layout.addWidget(self.export_btn)
+        
+        layout.addLayout(header_layout)
+        
+        # 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #e3f2fd;
+                border-radius: 8px;
+                text-align: center;
+                background-color: #f5f5f5;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+                border-radius: 6px;
+            }
+        """)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        # 状态标签
+        self.status_label = QLabel('💡 点击"盘前扫描"开始分析')
+        self.status_label.setStyleSheet("""
+            QLabel {
+                color: #666;
+                padding: 5px;
+                font-size: 14px;
+            }
+        """)
+        layout.addWidget(self.status_label)
+        
+        # 预测摘要区域（新增）
+        self.summary_group = self.create_summary_group()
+        layout.addWidget(self.summary_group)
+        
+        # 使用分割器创建三个区域
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        
+        # 1. 主线排名表
+        mainline_group = self.create_mainline_group()
+        splitter.addWidget(mainline_group)
+        
+        # 2. 龙头股池表
+        leader_group = self.create_leader_group()
+        splitter.addWidget(leader_group)
+        
+        # 3. 超跌候选表
+        oversold_group = self.create_oversold_group()
+        splitter.addWidget(oversold_group)
+        
+        # 设置初始大小比例
+        splitter.setSizes([250, 250, 200])
+        
+        layout.addWidget(splitter)
+    
+    def create_summary_group(self):
+        """创建预测摘要组（新增）"""
+        group = QGroupBox('🔮 核心预测摘要')
+        group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ffd700;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+                background-color: #fffef0;
+            }
+            QGroupBox::title {
+                color: #ff6b00;
+                subcontrol-origin: margin;
+                padding: 0 8px;
+            }
+        """)
+        
+        layout = QVBoxLayout(group)
+        
+        self.summary_text = QTextBrowser()
+        self.summary_text.setStyleSheet("""
+            QTextBrowser {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 10px;
+                font-size: 13px;
+            }
+        """)
+        self.summary_text.setMaximumHeight(200)
+        self.summary_text.setHtml("""
+            <p style='color: #999; text-align: center; padding: 20px;'>
+                点击"盘前扫描"后将显示预测摘要
+            </p>
+        """)
+        
+        layout.addWidget(self.summary_text)
+        group.setVisible(False)  # 初始隐藏
+        return group
+    
+    def create_mainline_group(self):
+        """创建主线排名组"""
+        group = QGroupBox('🎯 主线行业排名 Top 5')
+        group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #e3f2fd;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                color: #1a73e8;
+                subcontrol-origin: margin;
+                padding: 0 8px;
+            }
+        """)
+        
+        layout = QVBoxLayout(group)
+        
+        self.mainline_table = QTableWidget(0, 7)
+        self.mainline_table.setHorizontalHeaderLabels(
+            ['排名', '行业', '强度分', '状态', '持续天数', '成分股', '强势股']
+        )
+        self._setup_table(self.mainline_table)
+        
+        layout.addWidget(self.mainline_table)
+        return group
+    
+    def create_leader_group(self):
+        """创建龙头股池组"""
+        group = QGroupBox('👑 龙头股池 Top 10')
+        group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #e3f2fd;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                color: #34a853;
+                subcontrol-origin: margin;
+                padding: 0 8px;
+            }
+        """)
+        
+        layout = QVBoxLayout(group)
+        
+        self.leader_table = QTableWidget(0, 8)
+        self.leader_table.setHorizontalHeaderLabels(
+            ['代码', '名称', '类型', '所属主线', '综合评分', '技术分', '资金分', '3日主力流入']
+        )
+        self._setup_table(self.leader_table)
+        
+        layout.addWidget(self.leader_table)
+        return group
+    
+    def create_oversold_group(self):
+        """创建超跌候选组"""
+        group = QGroupBox('🎣 超跌反弹候选')
+        group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #e3f2fd;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 12px;
+            }
+            QGroupBox::title {
+                color: #ea4335;
+                subcontrol-origin: margin;
+                padding: 0 8px;
+            }
+        """)
+        
+        layout = QVBoxLayout(group)
+        
+        self.oversold_table = QTableWidget(0, 7)
+        self.oversold_table.setHorizontalHeaderLabels(
+            ['代码', '名称', '超跌系数', '回撤幅度', '技术背离', '支撑位', '当前价']
+        )
+        self._setup_table(self.oversold_table)
+        
+        layout.addWidget(self.oversold_table)
+        return group
+    
+    def _setup_table(self, table):
+        """统一设置表格样式"""
+        table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                gridline-color: #f0f0f0;
+                border-radius: 4px;
+            }
+            QTableWidget::item {
+                padding: 8px;
+            }
+            QHeaderView::section {
+                background-color: #f5f5f5;
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+                color: #333;
+            }
+            QTableWidget::item:selected {
+                background-color: #e3f2fd;
+            }
+        """)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.verticalHeader().setVisible(False)
+    
+    def _get_button_style(self, btn_type='primary'):
+        """获取按钮样式"""
+        if btn_type == 'primary':
+            return """
+                QPushButton {
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background: linear-gradient(135deg, #5568d3 0%, #65408b 100%);
+                }
+                QPushButton:pressed {
+                    background: linear-gradient(135deg, #4a5bc4 0%, #553474 100%);
+                }
+                QPushButton:disabled {
+                    background: #cccccc;
+                }
+            """
+        else:
+            return """
+                QPushButton {
+                    background-color: #f0f0f0;
+                    color: #333;
+                    border: 2px solid #ddd;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    min-width: 100px;
+                }
+                QPushButton:hover {
+                    background-color: #e0e0e0;
+                    border-color: #bbb;
+                }
+                QPushButton:pressed {
+                    background-color: #d0d0d0;
+                }
+                QPushButton:disabled {
+                    background: #f5f5f5;
+                    color: #999;
+                }
+            """
+    
+    def run_pre_market_scan(self):
+        """执行盘前扫描"""
+        self.scan_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText('🔄 正在执行盘前扫描...')
+        
+        # 创建并启动分析线程
+        self.scan_thread = QuantMainlineThread(self.analyzer, mode='pre_market')
+        self.scan_thread.progress.connect(self.update_progress)
+        self.scan_thread.finished.connect(self.on_scan_finished)
+        self.scan_thread.error.connect(self.on_scan_error)
+        self.scan_thread.start()
+    
+    def update_progress(self, value, message):
+        """更新进度"""
+        self.progress_bar.setValue(value)
+        self.status_label.setText(message)
+    
+    def on_scan_finished(self, results):
+        """扫描完成"""
+        self.current_results = results
+        
+        # 更新预测摘要（新增）
+        if 'summary' in results and results.get('mode') == 'predictive':
+            self.update_summary_display(results['summary'])
+            self.summary_group.setVisible(True)
+        
+        # 更新主线排名表
+        self.update_mainline_table(results['mainlines'])
+        
+        # 更新龙头股池表
+        self.update_leader_table(results['leaders'])
+        
+        # 更新超跌候选表
+        self.update_oversold_table(results['oversold'])
+        
+        # 恢复UI状态
+        self.scan_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"✅ 扫描完成 - {results['timestamp']}")
+        
+        QMessageBox.information(self, '扫描完成', 
+            f"✅ 盘前扫描完成！\n\n"
+            f"🎯 主线行业: {len(results['mainlines'])} 个\n"
+            f"👑 龙头股池: {len(results['leaders'])} 只\n"
+            f"🎣 超跌候选: {len(results['oversold'])} 个")
+    
+    def on_scan_error(self, error_msg):
+        """扫描出错"""
+        self.scan_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_label.setText(f"❌ 扫描失败: {error_msg}")
+        QMessageBox.critical(self, '扫描错误', error_msg)
+    
+    def update_mainline_table(self, mainlines):
+        """更新主线排名表"""
+        self.mainline_table.setRowCount(len(mainlines))
+        
+        for i, ml in enumerate(mainlines):
+            self.mainline_table.setItem(i, 0, self._create_centered_item(str(ml['rank'])))
+            self.mainline_table.setItem(i, 1, self._create_item(ml['industry']))
+            self.mainline_table.setItem(i, 2, self._create_centered_item(f"{ml['score']:.1f}"))
+            
+            # 状态带颜色
+            status_item = self._create_centered_item(ml['status'])
+            if '强势' in ml['status']:
+                status_item.setForeground(QColor('#ea4335'))
+            elif '新兴' in ml['status']:
+                status_item.setForeground(QColor('#fbbc04'))
+            self.mainline_table.setItem(i, 3, status_item)
+            
+            self.mainline_table.setItem(i, 4, self._create_centered_item(f"{ml['days']}天"))
+            self.mainline_table.setItem(i, 5, self._create_centered_item(str(ml['stocks'])))
+            self.mainline_table.setItem(i, 6, self._create_centered_item(str(ml['strong'])))
+    
+    def update_leader_table(self, leaders):
+        """更新龙头股池表"""
+        self.leader_table.setRowCount(len(leaders))
+        
+        for i, leader in enumerate(leaders):
+            self.leader_table.setItem(i, 0, self._create_centered_item(leader['code']))
+            self.leader_table.setItem(i, 1, self._create_item(leader['name']))
+            self.leader_table.setItem(i, 2, self._create_centered_item(leader['type']))
+            self.leader_table.setItem(i, 3, self._create_item(leader['industry']))
+            self.leader_table.setItem(i, 4, self._create_centered_item(f"{leader['score']:.1f}"))
+            self.leader_table.setItem(i, 5, self._create_centered_item(f"{leader['tech']:.1f}"))
+            self.leader_table.setItem(i, 6, self._create_centered_item(f"{leader['fund']:.1f}"))
+            
+            # 资金流入带颜色
+            flow_item = self._create_centered_item(f"{leader['flow']:.2f}亿")
+            flow_item.setForeground(QColor('#34a853') if leader['flow'] > 0 else QColor('#ea4335'))
+            self.leader_table.setItem(i, 7, flow_item)
+    
+    def update_oversold_table(self, oversold):
+        """更新超跌候选表"""
+        self.oversold_table.setRowCount(len(oversold))
+        
+        for i, stock in enumerate(oversold):
+            self.oversold_table.setItem(i, 0, self._create_centered_item(stock['code']))
+            self.oversold_table.setItem(i, 1, self._create_item(stock['name']))
+            self.oversold_table.setItem(i, 2, self._create_centered_item(f"{stock['coefficient']:.2f}"))
+            self.oversold_table.setItem(i, 3, self._create_centered_item(f"{stock['drawdown']:.1f}%"))
+            self.oversold_table.setItem(i, 4, self._create_centered_item('✅' if stock['divergence'] else '❌'))
+            self.oversold_table.setItem(i, 5, self._create_centered_item(f"¥{stock['support']:.2f}"))
+            self.oversold_table.setItem(i, 6, self._create_centered_item(f"¥{stock['price']:.2f}"))
+    
+    def _create_item(self, text):
+        """创建表格项"""
+        item = QTableWidgetItem(str(text))
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return item
+    
+    def _create_centered_item(self, text):
+        """创建居中的表格项"""
+        item = self._create_item(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return item
+    
+    def export_report(self):
+        """导出报告"""
+        if not self.current_results:
+            QMessageBox.warning(self, '导出失败', '没有可导出的数据，请先执行扫描')
+            return
+        
+        # 生成Markdown报告
+        report = self._generate_markdown_report()
+        
+        # 保存到文件
+        filename = f"主线狙击报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(report)
+            
+            QMessageBox.information(self, '导出成功', f'报告已保存到:\n{filename}')
+        except Exception as e:
+            QMessageBox.critical(self, '导出失败', f'保存报告时出错:\n{str(e)}')
+    
+    def _generate_markdown_report(self):
+        """生成Markdown格式报告"""
+        results = self.current_results
+        report = []
+        
+        report.append(f"# 📊 量化主线狙击报告\n")
+        report.append(f"**生成时间**: {results['timestamp']}\n")
+        report.append("---\n")
+        
+        # 主线排名
+        report.append("## 🎯 主线行业排名\n")
+        report.append("| 排名 | 行业 | 强度分 | 状态 | 持续天数 | 成分股 | 强势股 |")
+        report.append("|------|------|--------|------|----------|--------|--------|")
+        for ml in results['mainlines']:
+            report.append(
+                f"| {ml['rank']} | {ml['industry']} | {ml['score']:.1f} | "
+                f"{ml['status']} | {ml['days']}天 | {ml['stocks']} | {ml['strong']} |"
+            )
+        report.append("")
+        
+        # 龙头股池
+        report.append("## 👑 龙头股池\n")
+        report.append("| 代码 | 名称 | 类型 | 所属主线 | 综合评分 | 3日主力流入 |")
+        report.append("|------|------|------|----------|----------|--------------|")
+        for leader in results['leaders']:
+            report.append(
+                f"| {leader['code']} | {leader['name']} | {leader['type']} | "
+                f"{leader['industry']} | {leader['score']:.1f} | {leader['flow']:.2f}亿 |"
+            )
+        report.append("")
+        
+        # 超跌候选
+        report.append("## 🎣 超跌反弹候选\n")
+        report.append("| 代码 | 名称 | 超跌系数 | 回撤幅度 | 技术背离 | 当前价 |")
+        report.append("|------|------|----------|----------|----------|--------|")
+        for stock in results['oversold']:
+            report.append(
+                f"| {stock['code']} | {stock['name']} | {stock['coefficient']:.2f} | "
+                f"{stock['drawdown']:.1f}% | {'✅' if stock['divergence'] else '❌'} | ¥{stock['price']:.2f} |"
+            )
+        report.append("")
+        
+        report.append("---\n")
+        report.append("*本报告由量化主线共振狙击系统自动生成*")
+        
+        return "\n".join(report)

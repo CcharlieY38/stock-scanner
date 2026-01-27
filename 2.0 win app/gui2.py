@@ -672,7 +672,7 @@ class ModernStockAnalyzerGUI(QMainWindow):
             self.analyzer = ANALYZER_CLASS()
             
             # 智能检测分析器功能水平
-            detected_features = self.detect_analyzer_features()
+            detected_features = self.detect_analyzer_features()     
             actual_version = self.determine_actual_version(detected_features)
             
             self.log_display.append_streaming_text(f"✅ {actual_version}分析器初始化成功", "success")
@@ -692,6 +692,9 @@ class ModernStockAnalyzerGUI(QMainWindow):
             
             # 检查分析器特定功能
             self.check_analyzer_capabilities()
+            
+            # 现在analyzer已准备好，可以添加量化主线狙击标签页
+            self.add_quant_mainline_tab()
             
             self.log_display.append_streaming_text("🎉 系统初始化完成，可以开始分析！", "success")
             self.log_display.append_streaming_text("💡 支持股票代码：000001, 600036, 300019等", "info")
@@ -961,6 +964,35 @@ class ModernStockAnalyzerGUI(QMainWindow):
         if hasattr(self, 'version_label'):
             self.version_label.setText(f"{version} | {ANALYZER_CLASS.__name__}")
             self.setWindowTitle(f'现代股票分析系统 - {version}')
+    
+    def add_quant_mainline_tab(self):
+        """添加量化主线狙击标签页（在analyzer初始化后调用）"""
+        try:
+            from quant_mainline_tab import QuantMainlineTab
+            
+            # 检查tab_widget是否存在
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                quant_tab = QuantMainlineTab(self.analyzer)
+                self.tab_widget.addTab(quant_tab, "🎯 量化主线狙击")
+                if hasattr(self, 'log_display') and self.log_display:
+                    self.log_display.append_streaming_text("✅ 量化主线狙击模块已加载", "success")
+                print("✅ 量化主线狙击标签页已添加")
+            else:
+                if hasattr(self, 'log_display') and self.log_display:
+                    self.log_display.append_streaming_text("⚠️ 无法添加量化标签页：tab_widget未找到", "warning")
+                print("⚠️ tab_widget未找到")
+        except ImportError as e:
+            if hasattr(self, 'log_display') and self.log_display:
+                self.log_display.append_streaming_text(f"ℹ️ 量化主线狙击模块未加载: {str(e)}", "info")
+            print(f"❌ ImportError: {e}")
+            import traceback
+            traceback.print_exc()
+        except Exception as e:
+            if hasattr(self, 'log_display') and self.log_display:
+                self.log_display.append_streaming_text(f"⚠️ 加载量化模块时出错: {str(e)}", "warning")
+            print(f"❌ Exception: {e}")
+            import traceback
+            traceback.print_exc()
 
     def create_input_section(self):
         """创建输入控制区域"""
@@ -1007,6 +1039,10 @@ class ModernStockAnalyzerGUI(QMainWindow):
         # 推荐列表标签页
         recommend_tab = self.create_recommend_tab()
         tab_widget.addTab(recommend_tab, "🌟 推荐列表")
+
+        # 量化主线狙击标签页 - 延迟创建，等analyzer初始化后
+        # 保存tab_widget引用，稍后在init_analyzer中添加
+        self.tab_widget = tab_widget
 
         layout.addWidget(tab_widget)
 
@@ -1097,8 +1133,9 @@ class ModernStockAnalyzerGUI(QMainWindow):
         grid.addWidget(self.rec_exclude_st_cb, 0, 4)
 
         # 使用7日规则筛选
-        self.rec_use_rule_cb = QCheckBox("按7日规则筛选")
+        self.rec_use_rule_cb = QCheckBox("按7日规则筛选（需要K线数据，较慢且可能失败）")
         self.rec_use_rule_cb.setChecked(False)
+        self.rec_use_rule_cb.setToolTip("7日规则需要逐股获取K线数据，耗时较长且可能因网络问题失败。\n建议使用默认的快速推荐功能。")
         grid.addWidget(self.rec_use_rule_cb, 1, 0, 1, 2)
 
         # 生成和导出按钮（放入条件组内更显眼）
@@ -1751,24 +1788,50 @@ class ModernStockAnalyzerGUI(QMainWindow):
         """填充推荐表格"""
         try:
             self.rec_table.setRowCount(0)
+            if not rows:
+                self.log_display.append_streaming_text("⚠️ 推荐列表为空", "warning")
+                return
+            
             for item in rows:
                 row = self.rec_table.rowCount()
                 self.rec_table.insertRow(row)
+                
+                # 打印调试信息
+                print(f"[GUI] 处理推荐行: {item}")
+                
+                # 安全提取字段值
+                code = str(item.get('stock_code', ''))
+                name = str(item.get('stock_name', ''))
+                price = float(item.get('latest_price', 0.0))
+                pct = float(item.get('change_pct', 0.0))
+                pe = float(item.get('pe', 0.0))
+                mcap = float(item.get('mktcap_e', 0.0))
+                score = float(item.get('score', 0.0))
+                rec = str(item.get('recommendation', ''))
+                
                 vals = [
-                    item.get('stock_code',''),
-                    item.get('stock_name',''),
-                    f"{item.get('latest_price',0.0):.2f}",
-                    f"{item.get('change_pct',0.0):.2f}",
-                    f"{item.get('pe',0.0):.2f}",
-                    f"{item.get('mktcap_e',0.0):.2f}",
-                    f"{item.get('score',0.0):.1f}",
-                    item.get('recommendation','')
+                    code,
+                    name,
+                    f"{price:.2f}",
+                    f"{pct:.2f}",
+                    f"{pe:.2f}",
+                    f"{mcap:.2f}",
+                    f"{score:.1f}",
+                    rec
                 ]
+                
+                print(f"[GUI] 表格值: {vals}")
+                
                 for c, v in enumerate(vals):
                     self.rec_table.setItem(row, c, QTableWidgetItem(str(v)))
+            
             self.latest_recommendations = rows
-            self.log_display.append_streaming_text("✅ 推荐列表已更新，可双击行进行深度分析", "success")
+            self.log_display.append_streaming_text(f"✅ 推荐列表已更新({len(rows)}条)，可双击行进行深度分析", "success")
         except Exception as e:
+            import traceback
+            err_detail = traceback.format_exc()
+            print(f"[GUI] 填充推荐表格失败: {err_detail}")
+            self.log_display.append_streaming_text(f"❌ 填充推荐表格失败：{e}", "error")
             self.show_error(f"填充推荐表格失败：{e}")
         finally:
             self.btn_gen_rec.setEnabled(True)

@@ -1,0 +1,193 @@
+{
+  "prediction_config": {
+    "comment": "预测型量化系统配置 - 面向明日预测",
+    "version": "2.0_predictive"
+  },
+  
+  "mainline_engine": {
+    "comment": "预测型主线识别引擎配置",
+    
+    "prediction_weights": {
+      "comment": "预测权重（领先指标优先）",
+      "momentum_acceleration": 0.30,
+      "internal_strength": 0.25,
+      "capital_divergence": 0.20,
+      "sentiment_extreme": 0.15,
+      "trend_inertia": 0.10
+    },
+    
+    "thresholds": {
+      "min_prediction_score": 60,
+      "top_n": 10,
+      "lookback_days": 30,
+      "min_stocks_in_industry": 5
+    },
+    
+    "momentum_acceleration": {
+      "short_period_days": 3,
+      "long_period_days": 10,
+      "strong_threshold": 0.5,
+      "weak_threshold": -0.5
+    },
+    
+    "internal_strength": {
+      "lookback_days": 20,
+      "high_break_threshold": 0.01,
+      "strong_ratio_threshold": 10
+    },
+    
+    "capital_divergence": {
+      "lookback_days": 5,
+      "positive_divergence_score": 70,
+      "negative_divergence_penalty": -30
+    },
+    
+    "sentiment_extreme": {
+      "limit_up_moderate_min": 0.10,
+      "limit_up_moderate_max": 0.20,
+      "limit_up_extreme": 0.30,
+      "limit_down_extreme": 0.20
+    }
+  },
+  
+  "leader_monitor": {
+    "comment": "预测型龙头监控器配置",
+    
+    "leader_weights": {
+      "comment": "龙头评分权重（提高资金和情绪）",
+      "technical": 0.40,
+      "capital": 0.35,
+      "sentiment": 0.25
+    },
+    
+    "mainline_boost": {
+      "comment": "板块地位加成系数",
+      "rank_1": 1.20,
+      "rank_2": 1.15,
+      "rank_3": 1.10,
+      "rank_4_5": 1.05
+    },
+    
+    "leader_selection": {
+      "composite_leaders_top_n": 10,
+      "capital_leaders_top_n": 5,
+      "min_leader_score": 70
+    },
+    
+    "leader_types": {
+      "capital_leader": {
+        "min_capital_score": 85,
+        "min_net_inflow_billion": 2.0
+      },
+      "composite_leader": {
+        "min_composite_score": 88,
+        "must_in_top3_mainline": true
+      }
+    },
+    
+    "oversold_detection": {
+      "min_base_coefficient": 0.60,
+      "coefficient_weights": {
+        "drawdown": 0.6,
+        "divergence": 0.4
+      },
+      "drawdown_full_score_percent": 30,
+      "divergence_lookback_days": 20,
+      "support_level_method": "MA20",
+      "rebound_target_ratio": 0.70
+    }
+  },
+  
+  "prediction_aggregator": {
+    "comment": "预测聚合器配置",
+    
+    "confidence_thresholds": {
+      "high": {
+        "score_gap": 15,
+        "min_score": 80,
+        "require_capital_sentiment_resonance": true,
+        "min_capital_score": 80,
+        "min_sentiment_score": 75
+      },
+      "medium": {
+        "score_gap": 8,
+        "min_score": 65
+      },
+      "low": {
+        "score_gap": 0,
+        "min_score": 0
+      }
+    },
+    
+    "risk_detection": {
+      "sentiment_overheat_threshold": 50,
+      "capital_divergence_warning": 40,
+      "mainline_chaos_gap": 5,
+      "outflow_leaders_count": 2,
+      "internal_weakness_ratio": 0.20
+    },
+    
+    "market_sentiment": {
+      "optimistic_threshold": 70,
+      "neutral_threshold": 50
+    },
+    
+    "position_sizing": {
+      "high_confidence": "30-50%",
+      "medium_confidence": "20-30%",
+      "low_confidence": "10%以下或空仓",
+      "high_risk_reduction": "降低50%"
+    },
+    
+    "output": {
+      "max_primary_leaders": 3,
+      "max_alternative_leaders": 3,
+      "max_oversold_opportunities": 3,
+      "max_core_reasons": 5
+    }
+  },
+  
+  "data_sources": {
+    "comment": "数据源配置",
+    
+    "price_data": {
+      "source": "baostock",
+      "fallback": "akshare",
+      "cache_ttl_hours": 4
+    },
+    
+    "industry_data": {
+      "source": "akshare",
+      "cache_ttl_days": 7
+    },
+    
+    "capital_flow": {
+      "source": "eastmoney",
+      "timeout_seconds": 6.5,
+      "retry_times": 3
+    }
+  },
+  
+  "system": {
+    "comment": "系统运行配置",
+    
+    "execution": {
+      "pre_market_scan_time": "09:00",
+      "intraday_monitor_enabled": false,
+      "monitor_interval_seconds": 60,
+      "trading_hours_only": true
+    },
+    
+    "performance": {
+      "max_concurrent_analysis": 5,
+      "batch_size": 20,
+      "cache_enabled": true
+    },
+    
+    "logging": {
+      "level": "INFO",
+      "save_daily_predictions": true,
+      "predictions_dir": "predictions/"
+    }
+  }
+}

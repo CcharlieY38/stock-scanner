@@ -1,0 +1,60 @@
+{
+  "test_time": "2025-10-31T00:46:54.657432",
+  "test_codes": [
+    "002539",
+    "000686",
+    "600909"
+  ],
+  "results": {
+    "002539": {
+      "code": "002539",
+      "price_ok": true,
+      "pe_ok": false,
+      "mktcap_ok": false,
+      "price_data": {
+        "latest_price": 10.64,
+        "change_pct": 2.4061597690086622,
+        "data_points": 243
+      },
+      "valuation_data": {},
+      "errors": [
+        "估值数据为空"
+      ]
+    },
+    "000686": {
+      "code": "000686",
+      "price_ok": true,
+      "pe_ok": false,
+      "mktcap_ok": false,
+      "price_data": {
+        "latest_price": 9.25,
+        "change_pct": -0.9635974304068506,
+        "data_points": 243
+      },
+      "valuation_data": {},
+      "errors": [
+        "估值数据为空"
+      ]
+    },
+    "600909": {
+      "code": "600909",
+      "price_ok": true,
+      "pe_ok": false,
+      "mktcap_ok": false,
+      "price_data": {
+        "latest_price": 6.69,
+        "change_pct": -2.9027576197387415,
+        "data_points": 243
+      },
+      "valuation_data": {},
+      "errors": [
+        "估值数据为空"
+      ]
+    }
+  },
+  "summary": {
+    "total": 3,
+    "successful": 0,
+    "failed": 3
+  }
+}

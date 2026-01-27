@@ -46,6 +46,16 @@
         "fundamental_hours": 6,
         "news_hours": 2
     },
+    "network": {
+        "enable_proxies": false,
+        "fund_flow_timeout_seconds": 2.0,
+        "fund_flow_retries": 1,
+        "skip_fund_flow": false,
+        "use_calculated_flow": true,
+        "prefer_baostock": true,
+        "disable_akshare_on_failure": true,
+        "notes": "网络配置：API失败时自动使用K线数据计算资金流，优先使用BaoStock，akshare失败时自动禁用"
+    },
     "streaming": {
         "enabled": true,
         "show_thinking": true,
