@@ -8,6 +8,29 @@ import os
 import sys
 import logging
 import warnings
+
+# ── 绕过系统代理 ──────────────────────────────────────────────────────────────
+# macOS 可能配置了本地代理（如 Clash/V2Ray），若代理未运行会导致所有请求失败。
+# requests 会通过 urllib.request.getproxies() 读取 macOS 系统级代理（即使环境变量未设置），
+# 此处用 monkey-patch 强制让所有 Session 不使用代理。
+for _proxy_key in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY',
+                   'all_proxy', 'ALL_PROXY'):
+    os.environ.pop(_proxy_key, None)
+os.environ['no_proxy'] = '*'
+os.environ['NO_PROXY'] = '*'
+
+try:
+    import requests as _requests
+    _orig_merge_env = _requests.Session.merge_environment_settings
+    def _no_proxy_settings(self, url, proxies, stream, verify, cert):
+        settings = _orig_merge_env(self, url, proxies, stream, verify, cert)
+        settings['proxies'] = {}   # 强制清空代理
+        return settings
+    _requests.Session.merge_environment_settings = _no_proxy_settings
+except Exception:
+    pass  # requests 未安装时跳过
+# ─────────────────────────────────────────────────────────────────────────────
+
 import pandas as pd
 import numpy as np
 import json
@@ -59,7 +82,126 @@ logging.basicConfig(
 
 class EnhancedStockAnalyzer:
     def _get_baostock_snapshot(self) -> pd.DataFrame:
-        """获取主板A股快照（代码、名称、最新价、涨跌幅、市值等）"""
+        """【已替换】原BaoStock快照 → 改用腾讯接口批量拉取"""
+        return self._get_snapshot_from_tencent()
+
+    def _get_snapshot_from_tencent(self) -> pd.DataFrame:
+        """
+        主快照接口：腾讯行情 (qt.gtimg.cn)
+        1. 用新浪分页API获取全量A股代码+名称+PE+市值
+        2. 用腾讯批量接口补充实时价格/涨跌幅
+        返回列：代码, 名称, 最新价, 涨跌幅, 市盈率-动态, 总市值, 换手率, 流通市值
+        """
+        import urllib.request, json, time
+
+        # ── Step1：新浪分页获取全量A股（含PE、市值）──────────────────────────
+        self.logger.info("📊 [腾讯快照] 开始通过新浪API获取全量A股列表...")
+        all_stocks = []
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Referer': 'http://finance.sina.com.cn'
+        }
+        page = 1
+        while True:
+            url = (f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   f"Market_Center.getHQNodeData?page={page}&num=100&sort=symbol"
+                   f"&asc=1&node=hs_a&_s_r_a=page")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    batch = json.loads(r.read().decode('gbk', 'ignore'))
+                if not batch:
+                    break
+                all_stocks.extend(batch)
+                if page % 10 == 0:
+                    self.logger.info(f"  已获取 {len(all_stocks)} 只...")
+                page += 1
+            except Exception as e:
+                self.logger.warning(f"[腾讯快照] 新浪第{page}页失败: {e}")
+                break
+
+        if not all_stocks:
+            self.logger.warning("[腾讯快照] 新浪API未返回数据，降级到纯腾讯接口")
+            return pd.DataFrame()
+
+        self.logger.info(f"[腾讯快照] 新浪API获取到 {len(all_stocks)} 只A股")
+
+        # ── Step2：构建基础DataFrame ───────────────────────────────────────────
+        rows = []
+        for s in all_stocks:
+            try:
+                symbol = str(s.get('symbol', ''))  # e.g. sh600000
+                code   = str(s.get('code', ''))    # e.g. 600000
+                if len(code) != 6 or not code.isdigit():
+                    continue
+                price  = float(s.get('trade', 0) or 0)
+                chg    = float(s.get('changepercent', 0) or 0)
+                pe     = float(s.get('per', 0) or 0)
+                mktcap_wan = float(s.get('mktcap', 0) or 0)   # 万元
+                nmc_wan    = float(s.get('nmc', 0) or 0)       # 流通市值万元
+                turnover   = float(s.get('turnoverratio', 0) or 0)
+                rows.append({
+                    '代码':      code,
+                    '名称':      s.get('name', ''),
+                    '最新价':    price,
+                    '涨跌幅':    chg,
+                    '市盈率-动态': pe,
+                    '总市值':    round(mktcap_wan / 10000, 2),   # 转亿元
+                    '流通市值':  round(nmc_wan / 10000, 2),
+                    '换手率':    turnover,
+                    '_symbol':   symbol,
+                })
+            except Exception:
+                continue
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            self.logger.warning("[腾讯快照] 解析后为空")
+            return pd.DataFrame()
+
+        # 过滤无效行
+        df = df[(df['最新价'] > 0) & (df['市盈率-动态'] > 0) & (df['市盈率-动态'] < 1200)]
+        self.logger.info(f"[腾讯快照] 有效股票: {len(df)} 只，保存缓存...")
+
+        # ── Step3：用腾讯接口二次校准实时价格（可选，默认跳过以提速）────────
+        # 若需要腾讯实时价格可取消注释，但会增加约30秒耗时
+        # df = self._patch_price_from_tencent(df)
+
+        return df.drop(columns=['_symbol'], errors='ignore').reset_index(drop=True)
+
+    def _patch_price_from_tencent(self, df: 'pd.DataFrame') -> 'pd.DataFrame':
+        """用腾讯批量接口校准价格（每批100只，按需调用）"""
+        import urllib.request
+        codes = df['代码'].tolist()
+        price_map = {}
+        batch_size = 100
+        for i in range(0, len(codes), batch_size):
+            batch = codes[i:i+batch_size]
+            tencent_codes = []
+            for c in batch:
+                prefix = 'sh' if c.startswith(('6', '9')) else 'sz'
+                tencent_codes.append(f"{prefix}{c}")
+            url = 'http://qt.gtimg.cn/q=' + ','.join(tencent_codes)
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    text = r.read().decode('gbk', 'ignore')
+                for line in text.strip().split('\n'):
+                    parts = line.split('~')
+                    if len(parts) > 32:
+                        code = parts[2]
+                        price = float(parts[3]) if parts[3] else 0
+                        if price > 0:
+                            price_map[code] = price
+            except Exception:
+                pass
+        if price_map:
+            df['最新价'] = df['代码'].map(lambda c: price_map.get(c, df.loc[df['代码']==c, '最新价'].values[0] if len(df[df['代码']==c])>0 else 0))
+        return df
+
+    # ─── 原BaoStock快照（旧版，已停用）─────────────────────────────────────────
+    def _get_baostock_snapshot_legacy(self) -> pd.DataFrame:
+        """[已停用] 原BaoStock逐股拉取快照，速度极慢，保留备查"""
         try:
             import baostock as bs
             lg = bs.login()
@@ -237,8 +379,12 @@ class EnhancedStockAnalyzer:
         self.logger = logging.getLogger(__name__)
         self.config_file = config_file
         
-        # 初始化BaoStock连接
-        self._init_baostock()
+        # ── 数据源初始化：腾讯为主，新浪为副，BaoStock/东财已停用 ──────────
+        self.baostock_connected = False   # 不再使用BaoStock
+        self.akshare_available  = False   # 不再使用AkShare/东财
+        self.tencent_available  = True    # 腾讯接口（qt.gtimg.cn，HTTP无代理）
+        self.sina_available     = True    # 新浪接口（新浪分页列表API）
+        self.logger.info("✅ 数据源: 腾讯(主) + 新浪(副)，BaoStock/东财已停用")
         
         # 加载配置文件
         self.config = self._load_config()
@@ -1190,253 +1336,165 @@ class EnhancedStockAnalyzer:
         return float(np.tanh(score / max(1.0, hits)))
 
     def get_stock_data(self, stock_code, period='1y'):
-        """获取股票价格数据 - 优先使用BaoStock，失败回退到akshare；带缓存"""
-        # 缓存命中
+        """
+        获取股票历史K线 - 腾讯接口(主) + 新浪接口(副)，BaoStock/AkShare已停用
+        返回标准化 DataFrame：date, open, high, low, close, volume, amount,
+                               change_pct, change_amount, turnover_rate, amplitude
+        """
+        # ── 缓存命中 ─────────────────────────────────────────────────────────
         if stock_code in self.price_cache:
             cache_time, data = self.price_cache[stock_code]
             if datetime.now() - cache_time < self.cache_duration:
-                self.logger.info(f"使用缓存的价格数据: {stock_code}")
                 return data
 
-        # 如果配置优先BaoStock或akshare已被禁用，则只用BaoStock
-        if self.prefer_baostock or not self.akshare_available:
-            if not self.baostock_connected:
-                self.logger.error(f"BaoStock未连接且akshare不可用，无法获取{stock_code}数据")
-                raise Exception("BaoStock未连接且akshare不可用")
-        
-        # BaoStock 优先
-        if self.baostock_connected:
-            try:
-                end_date = datetime.now().strftime('%Y-%m-%d')
-                start_date = (datetime.now() - timedelta(days=self.analysis_params.get('technical_period_days', 365))).strftime('%Y-%m-%d')
-                formatted_code = self._format_stock_code_for_baostock(stock_code)
+        days = self.analysis_params.get('technical_period_days', 365)
+        end_dt   = datetime.now()
+        start_dt = end_dt - timedelta(days=days + 60)   # 多取60天保证够用
 
-                self.logger.info(f"正在从BaoStock获取 {stock_code} 的历史数据...")
-                rs = bs.query_history_k_data_plus(
-                    code=formatted_code,
-                    fields="date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,pctChg,isST",
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2"
-                )
-                if rs.error_code != '0':
-                    raise Exception(rs.error_msg)
-
-                data_list = []
-                while (rs.error_code == '0') & rs.next():
-                    data_list.append(rs.get_row_data())
-                if not data_list:
-                    raise ValueError("BaoStock未返回数据")
-
-                stock_data = pd.DataFrame(data_list, columns=rs.fields)
-                stock_data = self._preprocess_baostock_data(stock_data, stock_code)
-
-                # 缓存
-                self.price_cache[stock_code] = (datetime.now(), stock_data)
-                self.logger.info(f"✓ 成功从BaoStock获取 {stock_code} 的价格数据，共 {len(stock_data)} 条记录")
-                return stock_data
-            except Exception as e:
-                self.logger.warning(f"BaoStock价格数据失败: {e}")
-                if not self.akshare_available:
-                    self.logger.error("akshare已禁用，无法回退")
-                    raise Exception(f"BaoStock获取失败且akshare不可用: {e}")
-
-        # 回退到 akshare（仅当akshare可用时）
-        if self.akshare_available:
-            try:
-                data = self._get_stock_data_from_akshare(stock_code, period)
-                return data
-            except Exception as e:
-                self.logger.error(f"akshare获取数据失败: {e}")
-                if self.disable_akshare_on_failure:
-                    self.akshare_available = False
-                    self.logger.warning("❌ akshare多次失败，已自动禁用，后续只使用BaoStock")
-                raise
-        else:
-            raise Exception(f"BaoStock和akshare均不可用，无法获取{stock_code}数据")
-
-    def _preprocess_baostock_data(self, stock_data, stock_code):
-        """预处理BaoStock数据"""
+        # ── 主接口：腾讯前复权日K线 ──────────────────────────────────────────
         try:
-            # 过滤掉交易状态为0的数据（停牌等）
-            stock_data = stock_data[stock_data['tradestatus'] == '1'].copy()
-            
-            # 转换数据类型
-            numeric_columns = ['open', 'high', 'low', 'close', 'preclose', 'volume', 'amount', 'turn', 'pctChg']
-            for col in numeric_columns:
-                if col in stock_data.columns:
-                    stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce')
-            
-            # 转换日期格式
-            stock_data['date'] = pd.to_datetime(stock_data['date'])
-            stock_data = stock_data.sort_values('date').reset_index(drop=True)
-            
-            # 计算技术指标所需的额外字段
-            stock_data['volume_ratio'] = 1.0  # BaoStock暂时无法直接获取，设为默认值
-            stock_data['change_pct'] = stock_data['pctChg']  # 重命名以保持一致性
-            stock_data['change_amount'] = stock_data['close'] - stock_data['preclose']
-            stock_data['turnover'] = stock_data['amount']  # 成交额
-            stock_data['turnover_rate'] = stock_data['turn']  # 换手率
-            
-            # 计算振幅
-            stock_data['amplitude'] = ((stock_data['high'] - stock_data['low']) / stock_data['preclose'] * 100).round(2)
-            
-            # 数据验证
-            if len(stock_data) > 0:
-                latest_close = stock_data['close'].iloc[-1]
-                latest_open = stock_data['open'].iloc[-1]
-                self.logger.info(f"✓ 数据验证 - 最新收盘价: {latest_close}, 最新开盘价: {latest_open}")
-            
-            return stock_data
-            
+            data = self._get_kline_from_tencent(stock_code, start_dt, end_dt)
+            if data is not None and not data.empty:
+                self.price_cache[stock_code] = (datetime.now(), data)
+                self.logger.info(f"✓ 腾讯K线 {stock_code}：{len(data)} 条")
+                return data
         except Exception as e:
-            self.logger.error(f"BaoStock数据预处理失败: {e}")
-            raise
+            self.logger.warning(f"腾讯K线失败({stock_code}): {e}")
+
+        # ── 备用接口：新浪日K线 ───────────────────────────────────────────────
+        try:
+            data = self._get_kline_from_sina(stock_code, start_dt, end_dt)
+            if data is not None and not data.empty:
+                self.price_cache[stock_code] = (datetime.now(), data)
+                self.logger.info(f"✓ 新浪K线 {stock_code}：{len(data)} 条")
+                return data
+        except Exception as e:
+            self.logger.warning(f"新浪K线失败({stock_code}): {e}")
+
+        raise Exception(f"腾讯/新浪均无法获取 {stock_code} 历史K线")
+
+    def _tencent_code(self, stock_code: str) -> str:
+        """将6位代码转为腾讯格式，如 600000→sh600000，000001→sz000001"""
+        code = str(stock_code).strip()
+        if code.startswith(('6', '9')):
+            return f"sh{code}"
+        return f"sz{code}"
+
+    def _get_kline_from_tencent(self, stock_code: str, start_dt, end_dt) -> pd.DataFrame:
+        """
+        腾讯 JSONP 前复权日K线
+        URL: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh600000,day,start,end,640,qfq
+        """
+        import urllib.request, json
+        tc = self._tencent_code(stock_code)
+        s  = start_dt.strftime('%Y-%m-%d')
+        e  = end_dt.strftime('%Y-%m-%d')
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               f"?_var=kline_dayqfq&param={tc},day,{s},{e},640,qfq&r=0.1")
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': 'https://gu.qq.com/'
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            text = r.read().decode('utf-8', 'ignore')
+        # 剥离 JSONP 包装
+        if text.startswith('kline_dayqfq='):
+            text = text[len('kline_dayqfq='):]
+        obj = json.loads(text)
+        # 数据路径：data → tc → qfqday / day
+        tc_data = obj.get('data', {}).get(tc, {})
+        klines = tc_data.get('qfqday') or tc_data.get('day') or []
+        if not klines:
+            return pd.DataFrame()
+        # 每条：[日期, 开, 收, 高, 低, 成交量]  注意：腾讯顺序是 开收高低量
+        rows = []
+        for k in klines:
+            try:
+                rows.append({
+                    'date':   pd.to_datetime(k[0]),
+                    'open':   float(k[1]),
+                    'close':  float(k[2]),
+                    'high':   float(k[3]),
+                    'low':    float(k[4]),
+                    'volume': float(k[5]) * 100,   # 手→股
+                    'amount': 0.0,
+                })
+            except Exception:
+                continue
+        df = pd.DataFrame(rows).sort_values('date').reset_index(drop=True)
+        return self._standardize_kline(df, stock_code)
+
+    def _get_kline_from_sina(self, stock_code: str, start_dt, end_dt) -> pd.DataFrame:
+        """
+        新浪日K线（前复权）
+        URL: https://finance.sina.com.cn/realcharts/vline/sh600000.js
+        """
+        import urllib.request, json
+        tc = self._tencent_code(stock_code)  # sh600000 / sz000001
+        url = f"https://finance.sina.com.cn/realcharts/vline/{tc}.js?type=daily&_={int(datetime.now().timestamp())}"
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer':    'https://finance.sina.com.cn'
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            text = r.read().decode('utf-8', 'ignore')
+        # 新浪返回 JSON 数组：[[日期, 开, 高, 低, 收, 成交量, 成交额], ...]
+        # 或带变量名的 JSONP，剥离前缀
+        idx = text.find('[')
+        if idx == -1:
+            return pd.DataFrame()
+        text = text[idx:]
+        end_idx = text.rfind(']')
+        klines = json.loads(text[:end_idx+1])
+        rows = []
+        for k in klines:
+            try:
+                dt = pd.to_datetime(str(k[0]))
+                if dt < start_dt or dt > end_dt:
+                    continue
+                rows.append({
+                    'date':   dt,
+                    'open':   float(k[1]),
+                    'high':   float(k[2]),
+                    'low':    float(k[3]),
+                    'close':  float(k[4]),
+                    'volume': float(k[5]) * 100,
+                    'amount': float(k[6]) if len(k) > 6 else 0.0,
+                })
+            except Exception:
+                continue
+        df = pd.DataFrame(rows).sort_values('date').reset_index(drop=True)
+        return self._standardize_kline(df, stock_code)
+
+    def _standardize_kline(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        """统一K线字段：补全 preclose/change_pct/turnover_rate/amplitude 等"""
+        if df.empty:
+            return df
+        df = df.copy()
+        df['preclose'] = df['close'].shift(1)
+        df.loc[df.index[0], 'preclose'] = df['open'].iloc[0]
+        df['change_amount'] = df['close'] - df['preclose']
+        df['change_pct']    = (df['change_amount'] / df['preclose'] * 100).round(4)
+        df['amplitude']     = ((df['high'] - df['low']) / df['preclose'] * 100).round(4)
+        if 'amount' not in df.columns or df['amount'].sum() == 0:
+            df['amount'] = df['close'] * df['volume']
+        df['turnover']      = df['amount']
+        df['turnover_rate'] = 0.0   # 无流通股本数据时设0
+        df['volume_ratio']  = 1.0
+        df['code']          = stock_code
+        df = df.dropna(subset=['close', 'open']).reset_index(drop=True)
+        return df
 
     def _get_stock_data_from_akshare(self, stock_code, period='1y'):
-        """使用akshare获取股票价格数据（备用方案）"""
-        try:
-            import akshare as ak
-            
-            end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - timedelta(days=self.analysis_params['technical_period_days'])).strftime('%Y%m%d')
-            
-            self.logger.info(f"正在从akshare获取 {stock_code} 的历史数据...")
-            
-            stock_data = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"
-            )
-            
-            if stock_data.empty:
-                raise ValueError(f"akshare未返回数据")
-            
-            # 标准化akshare列名映射
-            try:
-                # akshare返回的列名通常是中文，需要映射为英文
-                column_mapping = {
-                    '日期': 'date',
-                    '股票代码': 'code',
-                    '开盘': 'open',
-                    '收盘': 'close', 
-                    '最高': 'high',
-                    '最低': 'low',
-                    '成交量': 'volume',
-                    '成交额': 'amount',
-                    '振幅': 'amplitude',
-                    '涨跌幅': 'change_pct',
-                    '涨跌额': 'change_amount',
-                    '换手率': 'turnover_rate'
-                }
-                
-                # 应用列名映射
-                stock_data = stock_data.rename(columns=column_mapping)
-                self.logger.info(f"akshare列名映射完成: {list(stock_data.columns)}")
-                
-                # 成交量单位转换：akshare是手(需要×100转为股数)
-                if 'volume' in stock_data.columns:
-                    stock_data['volume'] = stock_data['volume'] * 100
-                    self.logger.info("akshare成交量单位已转换为股数")
-                
-            except Exception as e:
-                self.logger.warning(f"列名标准化失败: {e}，保持原列名")
-            
-            # 确保必要的列存在并且映射正确
-            required_columns = ['close', 'open', 'high', 'low', 'volume']
-            missing_columns = []
-            
-            for col in required_columns:
-                if col not in stock_data.columns:
-                    # 尝试找到相似的列名
-                    similar_cols = [c for c in stock_data.columns if col in c.lower() or c.lower() in col]
-                    if similar_cols:
-                        stock_data[col] = stock_data[similar_cols[0]]
-                        self.logger.info(f"✓ 映射列 {similar_cols[0]} -> {col}")
-                    else:
-                        missing_columns.append(col)
-            
-            if missing_columns:
-                self.logger.warning(f"缺少必要的列: {missing_columns}")
-                # 如果缺少必要列，尝试使用位置索引映射
-                if len(stock_data.columns) >= 6:  # 至少有6列才能进行位置映射
-                    cols = list(stock_data.columns)
-                    # 通常akshare的列顺序是: 日期, [代码], 开盘, 收盘, 最高, 最低, 成交量, ...
-                    if 'code' in cols[1].lower() or len(cols[1]) == 6:  # 第二列是股票代码
-                        position_mapping = {
-                            cols[0]: 'date',
-                            cols[1]: 'code', 
-                            cols[2]: 'open',
-                            cols[3]: 'close',  # 确保第4列是收盘价
-                            cols[4]: 'high',
-                            cols[5]: 'low'
-                        }
-                        if len(cols) > 6:
-                            position_mapping[cols[6]] = 'volume'
-                    else:  # 没有代码列
-                        position_mapping = {
-                            cols[0]: 'date',
-                            cols[1]: 'open', 
-                            cols[2]: 'close',  # 确保第3列是收盘价
-                            cols[3]: 'high',
-                            cols[4]: 'low'
-                        }
-                        if len(cols) > 5:
-                            position_mapping[cols[5]] = 'volume'
-                    
-                    # 应用位置映射
-                    stock_data = stock_data.rename(columns=position_mapping)
-                    self.logger.info(f"✓ 应用位置映射: {position_mapping}")
-            
-            # 处理日期列
-            try:
-                if 'date' in stock_data.columns:
-                    stock_data['date'] = pd.to_datetime(stock_data['date'])
-                    stock_data = stock_data.set_index('date')
-                else:
-                    stock_data.index = pd.to_datetime(stock_data.index)
-            except Exception as e:
-                self.logger.warning(f"日期处理失败: {e}")
-            
-            # 确保数值列为数值类型
-            numeric_columns = ['open', 'close', 'high', 'low', 'volume']
-            for col in numeric_columns:
-                if col in stock_data.columns:
-                    try:
-                        stock_data[col] = pd.to_numeric(stock_data[col], errors='coerce')
-                    except:
-                        pass
-            
-            # 验证数据质量
-            if 'close' in stock_data.columns:
-                latest_close = stock_data['close'].iloc[-1]
-                latest_open = stock_data['open'].iloc[-1] if 'open' in stock_data.columns else 0
-                self.logger.info(f"✓ 数据验证 - 最新收盘价: {latest_close}, 最新开盘价: {latest_open}")
-                
-                # 检查收盘价是否合理
-                if pd.isna(latest_close) or latest_close <= 0:
-                    self.logger.error(f"❌ 收盘价数据异常: {latest_close}")
-                    raise ValueError(f"股票 {stock_code} 的收盘价数据异常")
-            
-            # 缓存数据
-            self.price_cache[stock_code] = (datetime.now(), stock_data)
-            
-            self.logger.info(f"✓ 成功获取 {stock_code} 的价格数据，共 {len(stock_data)} 条记录")
-            self.logger.info(f"✓ 数据列: {list(stock_data.columns)}")
-            
-            return stock_data
-            
-        except Exception as e:
-            self.logger.error(f"获取股票数据失败: {str(e)}")
-            # 如果是网络连接问题，标记akshare不可用
-            if 'proxy' in str(e).lower() or 'connection' in str(e).lower() or 'timeout' in str(e).lower():
-                if self.disable_akshare_on_failure:
-                    self.akshare_available = False
-                    self.logger.warning("❌ akshare网络连接失败，已自动禁用，后续只使用BaoStock")
-            raise Exception(f"akshare获取数据失败: {e}")
+        """[已停用] 原AkShare/东财历史K线，保留方法避免调用报错，直接转发到腾讯接口"""
+        days = self.analysis_params.get('technical_period_days', 365)
+        end_dt   = datetime.now()
+        start_dt = end_dt - timedelta(days=days + 60)
+        return self._get_kline_from_tencent(stock_code, start_dt, end_dt)
+
+    def _preprocess_baostock_data(self, stock_data, stock_code):
+        """[已停用] BaoStock数据预处理，兼容性保留"""
+        return self._standardize_kline(stock_data, stock_code)
 
     def get_comprehensive_fundamental_data(self, stock_code):
         """获取25项综合财务指标数据 - 优先使用BaoStock"""
@@ -3242,43 +3300,153 @@ class EnhancedStockAnalyzer:
             return "数据不足，建议谨慎"
 
     def _get_stock_snapshot_with_retry(self, max_retries: int = 3) -> pd.DataFrame:
-        """获取A股快照数据，带重试机制"""
-        # 如果akshare已被禁用，直接返回空
-        if not self.akshare_available:
-            self.logger.warning("⚠️ akshare已被禁用，跳过在线快照获取")
-            return pd.DataFrame()
-            
-        try:
-            import akshare as ak
-        except Exception:
-            self.logger.warning("⚠️ akshare 未安装，无法获取在线快照")
-            self.akshare_available = False
-            return pd.DataFrame()
-        
-        for attempt in range(max_retries):
+        """
+        获取A股快照 - 腾讯/新浪接口（主），AkShare/东财已停用
+        返回 DataFrame 含列：代码, 名称, 最新价, 涨跌幅, 市盈率-动态, 总市值, 换手率
+        """
+        self.logger.info("📊 正在通过腾讯/新浪接口获取A股快照...")
+
+        # ── 主接口：新浪分页API（完整A股列表，含PE/市值）─────────────────────
+        df = self._snapshot_from_sina()
+        if df is not None and not df.empty:
+            self.logger.info(f"✅ 新浪快照获取成功，共 {len(df)} 只股票")
             try:
-                self.logger.info(f"📊 正在获取A股实时快照（尝试 {attempt + 1}/{max_retries}）...")
-                spot = ak.stock_zh_a_spot_em()
-                if spot is not None and not spot.empty:
-                    self.logger.info(f"✅ 成功获取A股快照，共 {len(spot)} 只股票")
-                    try:
-                        self._save_spot_snapshot_cache(spot)
-                    except Exception as e:
-                        self.logger.debug(f"缓存保存失败: {e}")
-                    return spot
-            except Exception as e:
-                self.logger.warning(f"⚠️ 第 {attempt + 1} 次尝试失败: {str(e)[:100]}")
-                # 检测是否是网络连接问题
-                if 'proxy' in str(e).lower() or 'connection' in str(e).lower() or 'timeout' in str(e).lower():
-                    if self.disable_akshare_on_failure and attempt >= max_retries - 1:
-                        self.akshare_available = False
-                        self.logger.warning("❌ akshare网络连接持续失败，已自动禁用")
-                if attempt < max_retries - 1:
-                    import time
-                    time.sleep(1 * (attempt + 1))  # 递增等待时间
-        
-        self.logger.warning("⚠️ 在线快照获取失败，尝试使用本地缓存")
+                self._save_spot_snapshot_cache(df)
+            except Exception:
+                pass
+            return df
+
+        # ── 备用接口：腾讯批量行情 (qt.gtimg.cn) ─────────────────────────────
+        self.logger.warning("⚠️ 新浪API失败，降级到腾讯接口...")
+        df = self._snapshot_from_tencent_batch()
+        if df is not None and not df.empty:
+            self.logger.info(f"✅ 腾讯快照获取成功，共 {len(df)} 只股票")
+            try:
+                self._save_spot_snapshot_cache(df)
+            except Exception:
+                pass
+            return df
+
+        self.logger.warning("⚠️ 腾讯/新浪接口均失败，尝试使用本地缓存")
         return pd.DataFrame()
+
+    def _snapshot_from_sina(self) -> 'pd.DataFrame':
+        """新浪分页接口：获取全量A股快照（含PE、市值）"""
+        import urllib.request, json
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Referer': 'http://finance.sina.com.cn'
+        }
+        all_stocks = []
+        page = 1
+        while True:
+            url = (f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   f"Market_Center.getHQNodeData?page={page}&num=100&sort=symbol"
+                   f"&asc=1&node=hs_a&_s_r_a=page")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    batch = json.loads(r.read().decode('gbk', 'ignore'))
+                if not batch:
+                    break
+                all_stocks.extend(batch)
+                page += 1
+                if page > 80:   # 最多80页（8000只，足够覆盖全A股）
+                    break
+            except Exception as e:
+                self.logger.warning(f"[新浪快照] 第{page}页失败: {e}")
+                break
+
+        if not all_stocks:
+            return pd.DataFrame()
+
+        rows = []
+        for s in all_stocks:
+            try:
+                code = str(s.get('code', ''))
+                if len(code) != 6 or not code.isdigit():
+                    continue
+                price = float(s.get('trade', 0) or 0)
+                if price <= 0:
+                    continue
+                rows.append({
+                    '代码':       code,
+                    '名称':       s.get('name', ''),
+                    '最新价':     price,
+                    '涨跌幅':     float(s.get('changepercent', 0) or 0),
+                    '市盈率-动态': float(s.get('per', 0) or 0),
+                    '总市值':     round(float(s.get('mktcap', 0) or 0) / 10000, 2),   # 万→亿
+                    '流通市值':   round(float(s.get('nmc', 0) or 0) / 10000, 2),
+                    '换手率':     float(s.get('turnoverratio', 0) or 0),
+                })
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df[df['市盈率-动态'] > 0]
+        return df.reset_index(drop=True)
+
+    def _snapshot_from_tencent_batch(self) -> 'pd.DataFrame':
+        """
+        腾讯批量接口：qt.gtimg.cn 
+        用已知的主板/创业板/科创板代码段构造请求，返回实时行情
+        """
+        import urllib.request
+        # 构造全量代码（0开头→sz，6开头→sh，3开头→sz，688→sh）
+        sh_ranges = [range(600000, 605000), range(601000, 606000),
+                     range(600000, 610000), range(688000, 688999)]
+        sz_ranges = [range(0, 3000), range(300000, 302000)]
+        all_codes = []
+        for r in sh_ranges:
+            for c in r:
+                all_codes.append(f"sh{c:06d}")
+        for r in sz_ranges:
+            for c in r:
+                all_codes.append(f"sz{c:06d}")
+        # 去重
+        all_codes = list(dict.fromkeys(all_codes))
+
+        rows = []
+        batch_size = 100
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        for i in range(0, len(all_codes), batch_size):
+            batch = all_codes[i:i+batch_size]
+            url = 'http://qt.gtimg.cn/q=' + ','.join(batch)
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    text = r.read().decode('gbk', 'ignore')
+                for line in text.strip().split('\n'):
+                    parts = line.split('~')
+                    if len(parts) < 46:
+                        continue
+                    code = parts[2]
+                    name = parts[1]
+                    if not code or len(code) != 6 or not code.isdigit() or not name:
+                        continue
+                    price = float(parts[3]) if parts[3] else 0
+                    yclose = float(parts[4]) if parts[4] else 0
+                    if price <= 0 or yclose <= 0:
+                        continue
+                    chg = round((price - yclose) / yclose * 100, 2)
+                    pe  = float(parts[39]) if parts[39] else 0
+                    mktcap = float(parts[45]) if parts[45] else 0  # 亿元
+                    rows.append({
+                        '代码': code, '名称': name,
+                        '最新价': price, '涨跌幅': chg,
+                        '市盈率-动态': pe, '总市值': mktcap,
+                        '流通市值': float(parts[44]) if parts[44] else 0,
+                        '换手率': 0.0,
+                    })
+            except Exception:
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df = df[df['最新价'] > 0]
+        return df.reset_index(drop=True)
 
     def get_quick_recommendations(self, top_n: int = 20, min_mktcap_e: float = 30.0, exclude_st: bool = True) -> List[Dict]:
         """基于快照的轻量级推荐列表（不拉取逐股深度数据，秒级返回）。
